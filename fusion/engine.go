@@ -35,7 +35,6 @@ type Engine struct {
 	rejected    int
 	opsUsed     int // 当前 Ingest 调用内累计的确定性操作数
 	nowFunc     func() time.Time
-	sawRefKind  bool // 是否曾见到配置指定的参考路
 }
 
 // anchorProbeCost 一次时延网格搜索的折算操作成本上限（粗+精网格
@@ -224,17 +223,21 @@ type ingestOut struct {
 
 // ingestOne 校验单条观测、换算统一时间并入缓冲（须持写锁）。
 func (e *Engine) ingestOne(o Observation) (r ingestOut) {
-	if e.cfg.EnableAlignment && o.Kind == e.cfg.AlignRef {
-		e.sawRefKind = true
-	}
 	res := e.align.Admit(o)
 	kind := o.Kind
 	r.deltaOps = res.ops
 
 	// 对齐尚不可信：明确区分“样本不足/参考未覆盖/宽限内校准”与“超可
-	// 信范围”。ready=false 时观测将挂起；非参考路若缓冲已满则拒绝（保
-	// 持待处理有界），参考路由对齐层保证恒等就绪、不会走到这里。
+	// 信范围”。
 	if !res.ready {
+		if res.reason == ReasonTimeUnavailable {
+			// 漂移越界：该路当前口径明确不可信，直接拒绝且不入待处理缓
+			// 冲——越界映射不会自行恢复成“旧数据仍有效”，缓存它只会让
+			// 待处理数据在运行中无限堆积。映射恢复可信后该路重新校准。
+			r.d = e.commit(Decision{Obs: o, Accepted: false, RawStamp: o.Stamp,
+				Aligned: res.aligned, Reason: ReasonTimeUnavailable, Detail: res.detail})
+			return r
+		}
 		if e.buf.Len() >= e.cfg.Limits.MaxPendingObs {
 			r.d = e.commit(Decision{Obs: o, Accepted: false, RawStamp: o.Stamp,
 				Aligned: res.aligned, Reason: ReasonBacklogExceeded,
@@ -244,7 +247,9 @@ func (e *Engine) ingestOne(o Observation) (r ingestOut) {
 		}
 		r.d = e.commit(Decision{Obs: o, Accepted: false, RawStamp: o.Stamp,
 			Aligned: res.aligned, Reason: res.reason, Detail: res.detail})
-		// 仍暂缓入缓冲（out_of_range 也保留，待映射恢复后重判）。
+		// 校准中的观测暂缓入缓冲：宽限内不消费；锁定后按换算时间重判，
+		// 宽限后由 Retry/Remap 以恒等降级放行。缓冲因此只堆积宽限窗口
+		// （AlignCalibrateAfter）内的有限数据，规模始终有界。
 		r.p = pendingItem{obs: o, aligned: res.aligned, raw: o.Stamp, ready: false, kind: kind}
 		r.pushed = e.buf.Push(r.p)
 		return r
@@ -287,7 +292,8 @@ func (e *Engine) ingestOne(o Observation) (r ingestOut) {
 		return r
 	}
 
-	r.p = pendingItem{obs: o, aligned: res.aligned, raw: o.Stamp, ready: true, kind: kind}
+	r.p = pendingItem{obs: o, aligned: res.aligned, raw: o.Stamp,
+		ready: true, degraded: res.degraded, kind: kind}
 	if !e.buf.Push(r.p) {
 		// 容量已在批前预检；到此视为积压拒绝。
 		r.d = e.commit(Decision{Obs: o, RawStamp: o.Stamp,
@@ -316,6 +322,7 @@ func (e *Engine) retryPending() {
 		if r.ready {
 			p.ready = true
 			p.aligned = r.aligned
+			p.degraded = r.degraded
 			e.buf.SetIndex(i, p)
 		}
 	}
@@ -325,6 +332,13 @@ func (e *Engine) retryPending() {
 func (e *Engine) drain(deadline time.Time) {
 	for {
 		horizon, haveWM := e.alignedHorizon()
+		// 丢弃已永久落后于可消费水线的暂缓项：它们（如越界、或宽限内
+		// 校准中被水线越过的观测）即使将来变为就绪，其换算时间也必然
+		// 早于当前推进点、只会被陈旧护栏拒绝。在此显式驱逐保证“待处理
+		// 数据在运行中不会因一路对齐未就绪而无限堆积”。
+		if e.cfg.EnableAlignment {
+			e.evictExpiredPending(horizon, haveWM)
+		}
 		idx, ok := e.buf.MinReadyIndex(horizon)
 		if !ok {
 			return
@@ -336,6 +350,35 @@ func (e *Engine) drain(deadline time.Time) {
 		p, _ := e.buf.PopIndex(idx)
 		e.consume(p)
 	}
+}
+
+// evictExpiredPending 移除未就绪且统一时间早于 horizon−StaleAfter 的
+// 缓冲项，按 time_unavailable（对齐口径不可信）或 stale 记录并丢弃。
+func (e *Engine) evictExpiredPending(horizon time.Time, haveWM bool) {
+	if !haveWM || horizon.IsZero() {
+		return
+	}
+	cutoff := horizon.Add(-e.cfg.StaleAfter)
+	keep := e.buf.items[:0]
+	for _, p := range e.buf.items {
+		if !p.ready && p.aligned.Before(cutoff) {
+			// 越界路旧积压 → time_unavailable；其余仅因时间永久落后而
+			// 失去意义的暂缓项 → stale。新观测在 Admit 时已明确区分过
+			// “样本不足”与“超范围”，这里只做缓冲卫生清理。
+			reason := ReasonStale
+			detail := "pending item permanently behind watermark: dropped as stale"
+			if m := e.align.models[p.kind]; m != nil && m.state == AlignOutOfRange {
+				reason = ReasonTimeUnavailable
+				detail = "clock mapping out of trusted range: pending item dropped"
+			}
+			e.commit(Decision{Obs: p.obs, Accepted: false, RawStamp: p.raw,
+				Aligned: p.aligned, Reason: reason, Detail: detail})
+			e.rejected++
+			continue
+		}
+		keep = append(keep, p)
+	}
+	e.buf.items = keep
 }
 
 // alignedHorizon 计算本次可安全消费的统一时间上界：
@@ -405,8 +448,20 @@ func (e *Engine) consume(p pendingItem) {
 		return
 	}
 
-	// 状态只能继续往后走：对齐换算后不晚于当前状态的观测不重复消费。
+	// 状态只能继续往后走：换算后的时间早于当前状态（超过陈旧容差）的
+	// 观测绝不作为量测注入。这是在线对齐的关键护栏——校准期暂缓、锁
+	// 定后批量重判放行的迟到数据、以及映射切换瞬间的旧积压，都可能在
+	// 全序上落在当前状态之后；把它们当成“当前”量测会把几秒前的位姿/
+	// 速度硬拉进滤波器（时变轨迹上方向完全不同），直接导致速度与位置
+	// 发散。此处统一拒绝，保证“显示可信就真的用对；旧数据绝不假装新”。
 	dt := o.Stamp.Sub(e.est.Nominal.Stamp).Seconds()
+	if dt < -e.cfg.StaleAfter.Seconds() {
+		e.commit(Decision{Obs: o, RawStamp: p.raw, Aligned: p.aligned,
+			Reason: ReasonStale,
+			Detail: fmt.Sprintf("aligned %v older than state %v by > %v at consume",
+				o.Stamp, e.est.Nominal.Stamp, e.cfg.StaleAfter)})
+		return
+	}
 	if dt > 0 {
 		if o.Kind == SensorIMU {
 			e.est.Predict(o, dt)
@@ -416,11 +471,11 @@ func (e *Engine) consume(p pendingItem) {
 		e.est.AddProcessNoise(e.cfg.ProcessNoise, dt)
 	}
 
-	// 传感器降级检查：以各路统一时间衡量缺测间隔。
+	// 传感器降级检查：以各路统一时间衡量缺测间隔；对齐超宽限后的恒等
+	// 降级放行同样按噪声膨胀处理（时间口径未校准，降权使用）。
 	e.refreshDegraded(o.Stamp)
-	inflated := false
-	if e.degraded[o.Kind] {
-		inflated = true
+	inflated := p.degraded || e.degraded[o.Kind]
+	if inflated {
 		for i := range o.CovDiag {
 			o.CovDiag[i] *= e.cfg.DegradedNoiseInflate
 		}
@@ -519,6 +574,9 @@ func (e *Engine) AdvanceTo(t time.Time) Decision {
 		limit = wm
 	}
 	for {
+		if e.cfg.EnableAlignment {
+			e.evictExpiredPending(limit, true)
+		}
 		idx, ok := e.buf.MinReadyIndex(limit)
 		if !ok {
 			break

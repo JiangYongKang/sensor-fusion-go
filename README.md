@@ -31,35 +31,53 @@
   相同的观测以 `duplicate` 拒绝，绝不重复参与更新。
 - **倒退**：时间戳早于已消费序列的观测以 `timestamp_regress` 拒绝；
   落后超过 `StaleAfter` 的以 `stale` 拒绝，绝不把陈旧数据当最新数据。
-- **时钟漂移（在线对齐，新增能力）**：`EnableAlignment=true` 时为每路
-  传感器在线估计其时钟到统一时间轴的仿射关系
-  `unified = skew·raw + offset`，换算后的时间真正参与状态推进、顺序
-  判定、陈旧/倒退判定与降级判定。
-  - 以一路（默认 IMU，可用 `AlignAutoRef/AlignRef` 选择）为时间基准，
-    其余为待对齐路。
+- **时钟漂移（在线对齐）**：`EnableAlignment=true` 时为每路传感器在
+  线估计其时钟到统一时间轴的映射，换算后的统一时间**真正、且唯一**
+  参与状态推进、顺序判定、陈旧/倒退判定、降级判定与消费水线计算。
+  - 以一路（默认自动选 IMU，可用 `AlignAutoRef/AlignRef` 指定）为
+    **时间基准（参考路）**，参考路恒等映射；统一时间轴即参考路时钟。
   - 利用各路共享的机身偏航运动做跨路时延估计：信号按时间有序缓存，
-    连续偏航角由有序环统一积分/解卷绕（免疫批内乱序），在居中窗口上
-    做去均值形状相关 + 联合 (skew, lag) 网格搜索得到锚点；锚点用分段
-    线性模型换算，长历史稳健跟踪斜率，近期窗口决定时延。
-  - **状态机（原因可区分，绝不把未对齐数据当已对齐）**：
-    `cold`（无漂移证据，恒等放行、零额外开销，因此关闭对齐或无漂移
-    输入的既有行为完全不变）→ `calibrating/align_calibrating`
-    （样本不足/参考未覆盖，观测暂缓不入更新）→ `locked`（锚点数、跨度、
-    残差、斜率/偏移范围均达标，按换算时间消费）；斜率或偏移超
-    `AlignMaxSkew/AlignMaxDrift` 判 `out_of_range / time_unavailable`。
-  - **校准宽限**：某路首次出现后 `AlignCalibrateAfter`（默认 5s）内
-    暂不采用；超过宽限仍未锁定，则按原始时间（恒等）**降级放行**参与
-    融合并标记降级，保证对齐层永不饿死滤波器（只有真正越界才持续拒绝）。
-  - 一路长时间无数据时，对齐水线在 `DegradeAfter+AlignSearchRange`
-    后不再被该路冻结，避免单路缺测阻塞其他路、撑爆缓冲。
-  - 零漂移输入下估计恒为 skew=1、offset=0（整数纳秒坐标），结果与
-    原始时间戳行为逐位一致；相同输入重复运行严格一致（对齐相关为
-    纯确定性计算，不读墙钟、无随机数）。
+    连续偏航角由有序环统一积分/解卷绕（免疫批内乱序），在滞后居中窗
+    口上做去均值形状相关 + 联合 (skew, lag) 网格搜索得到锚点；锚点用
+    **分段线性换算**（天然跟随分段换向的时变漂移），长历史稳健估计
+    斜率、近期锚点决定时延。`verdict / Remap / AlignedTime / 水线`
+    全部走同一个换算入口 `mapTimeNS`，保证“对外显示的时间”与“实际
+    参与状态推进的时间”严格一致。
+  - **状态机（显示什么口径，就一定按什么口径消费）**：
+    - `cold`：尚无统计显著的漂移证据，按原始戳**恒等放行**。判定漂移
+      证据时不看原点截距（恒定斜率漂移在原点截距≈0），而要求近期锚点
+      直接测得的 lag（y−x）中位数超过 `AlignDetect`，因此陀螺噪声积分
+      造成的毫秒级假峰不会误触发。零漂移输入全程停在 cold。
+    - `calibrating`：已有漂移证据但锚点数/跨度/残差尚不可信。观测
+      **暂缓、绝不参与更新**，对外原因 `align_calibrating`（=样本不足/
+      参考未覆盖，可与“超范围”明确区分）。
+    - `locked`：锚点数、跨度、残差、斜率/偏移范围全部达标，按换算时间
+      消费；`AlignedTime` 仅在此态返回 `(t,true)`。
+    - `out_of_range`：斜率或偏移超 `AlignMaxSkew/AlignMaxDrift`，观测
+      以 `time_unavailable` 拒绝（与样本不足的 `align_calibrating`
+      分开），且**不进入待处理缓冲**。
+  - **校准宽限（不饿死、不冻结、不堆积）**：宽限自“发现漂移证据”起算
+    `AlignCalibrateAfter`（默认 5s，而非自该路首次出现起算）。宽限内
+    观测暂缓；超过宽限仍未锁定则按原始戳**恒等降级放行**并把观测噪声
+    膨胀（`sensor_degraded`），只有真正越界才持续拒绝。
+  - **统一时间轴不被单路卡住**：对齐水线只取参考路与**已锁定**路的覆盖
+    交集；`cold / calibrating / out_of_range` 路不冻结水线，参考路与
+    其他路照常推进。已锁定路超过 `DegradeAfter+AlignSearchRange` 缺测
+    时按暂时缺测处理。永久落后于水线的暂缓项（越界旧积压等）会被显式
+    驱逐并记 `time_unavailable/stale`，因此**待处理数据在运行中始终
+    有界**，不会因一路对不齐而无限堆积。
+  - **旧量测护栏**：无论因锁定后批量重判、映射切换还是迟到到达，凡是
+    换算时间早于当前状态超过 `StaleAfter` 的观测，一律在消费侧以
+    `stale` 拒绝，绝不把几秒前的位姿/速度当成“当前”量测注入——这是
+    时变漂移下不发散的关键。
+  - **零漂移兼容**：无漂移输入各路恒为 cold、恒等映射，开对齐与关对齐
+    的位姿/速度结果**逐位一致**；相同输入重复运行严格一致（对齐相关
+    为纯确定性计算，不读墙钟、无随机数）。
   - 配置：`AlignDetect / AlignMinSamples / AlignMinSpan / AlignTolerance
     / AlignMaxSkew / AlignMaxDrift / AlignWindow / AlignSearchRange /
     AlignReleaseMargin / AlignCalibrateAfter / AlignAutoRef / AlignRef`。
   - 查询：`Engine.AlignmentStats()` 返回每路状态/skew/offset/残差/样本；
-    `Engine.AlignedTime(kind, raw)` 返回某路原始戳对应的统一时间。
+    `Engine.AlignedTime(kind, raw)` 仅在 locked 时返回 `(统一时间,true)`。
 - 相同输入序列重复运行得到一致结果（引擎内部无随机性；唯一的耗时
   上限检查按既定策略拒绝并记录，不产生部分更新）。
 
@@ -82,6 +100,11 @@
     剩余预算不足以完成本批时整批 `process_budget`（原因与批大小、积压
     超限区分开）；`MaxProcessTime` 仅作宽松墙钟兜底。对齐层失败时
     整批回滚（不破坏已建立的时钟基准与各路模型）。
+  - **对齐相关的待处理边界**：校准宽限内暂缓项只可能来自最近
+    `AlignCalibrateAfter` 窗口（有界）；`out_of_range` 新观测直接拒绝、
+    不入缓冲；锁定后转越界/永久落后水线的旧暂缓项在排水时被显式驱逐
+    （记 `time_unavailable/stale`）。因此待处理规模始终 ≤
+    `MaxPendingObs`，运行中不随时间线性增长。
   - 所有拒绝均不留部分更新，拒绝后引擎仍可继续处理后续合法数据；
     待处理数据在运行期始终有界。
 - 每次判定（接受/拒绝及原因、马氏距离）写入有界判定日志，
@@ -114,11 +137,22 @@
     `TestReorderDelayWindow`）；
   - 重复/倒退/陈旧/漂移的可区分拒绝；
   - 异常值门限拒绝且不污染状态（与参照运行逐位比较）；
-  - **在线时间对齐**：时变分段漂移下两路均锁定、换算后时间参与融合
-    且时间错位很小（`TestAlignmentTracksTimeVaryingDrift`）；
-    恒定慢漂移斜率跟踪（`TestAlignmentConstantSkew`）；样本不足判
-    `align_calibrating`（`TestAlignmentUnavailableReason`）；斜率越界
-    判 `out_of_range/time_unavailable`（`TestAlignmentOutOfRange`）；
+  - **在线时间对齐**：时变分段换向漂移下，直接断言**开对齐的融合误差
+    不劣于关对齐、且全程有界不发散**，两路都真正锁定
+    （`TestTimeVaryingDriftAlignedNotWorse`，1 分钟与 3 分钟逐点对比，
+    不放宽噪声或既有精度门限）；零漂移输入开/关对齐**逐位一致**且各路
+    保持 `cold`（`TestZeroDriftAlignmentIsBitIdentical`）；对外换算时间
+    就是消费口径（`TestAlignmentDisplayedTimeIsConsumedTime`）；样本不足
+    暂缓且积压有界、宽限后不饿死（`TestAlignmentPendingBoundedWhen
+    Calibrating`）；越界判 `out_of_range/time_unavailable` 且**不堆积**
+    （`TestAlignmentOutOfRangeRejectedNotBuffered`、
+    `TestAlignmentOutOfRange`）；一路不可信不冻结时间轴
+    （`TestAlignmentDoesNotFreezeTimeline`）；恒定慢漂移斜率跟踪
+    （`TestAlignmentConstantSkew`）；
+  - **30 分钟长跑（真实叠加各路时变漂移）**：开对齐、激励轨迹、各路多
+    段换向漂移 + 离群/缺帧/乱序/一路长缺测下，误差有界不发散、两路全程
+    锁定、积压有界、重复运行严格一致（`TestLongRunHalfHourAligned`，
+    >22 万观测）；关对齐基线 `TestLongRunHalfHour` 保留不回归；
   - **容量与处理预算边界**：单批超限 `limit_exceeded`、积压过多
     `backlog_exceeded`、确定性操作预算不足 `process_budget`，且拒绝
     后引擎继续（`TestBatchLimitRejected/TestBacklogRejected/
@@ -129,9 +163,26 @@
   - 60 秒全场景（`TestLongRunFusion`）与 **30 分钟**大流量长跑
     （`TestLongRunHalfHour`，>22 万观测）：姿态/速度/协方差稳定、
     四元数单位、待处理积压有界、离群被捕获、重复运行严格一致。
-- 运行验证：
+- 运行验证（在仓库根目录执行）：
 
 ```sh
-go test ./... -race -count=1 -v   # 全部测试（日志含关键输入与判定依据）
+# 快速逻辑回归（-short 会跳过两个 30 分钟长跑）
+go test ./... -short -count=1
+
+# 本次修复的核心场景（时变漂移开对齐不劣于关对齐、不发散）
+go test ./fusion -count=1 -v -run TestTimeVaryingDriftAlignedNotWorse
+# 零漂移开/关对齐逐位一致
+go test ./fusion -count=1 -v -run TestZeroDriftAlignmentIsBitIdentical
+# 样本不足 / 越界不堆积 / 不冻结时间轴
+go test ./fusion -count=1 -v -run 'Calibrating|OutOfRange|DoesNotFreeze'
+# 容量与处理预算边界
+go test ./fusion -count=1 -v -run 'BatchLimit|Backlog|OpBudget'
+# 预测/更新/快照并发交错（数据竞争检测，只跑并发用例，避免重型回放拖慢）
+go test ./fusion -race -count=1 -run 'TestConcurrent'
+# 30 分钟、各路时变漂移真正叠加的长跑（含开/关对齐各一个）
+go test ./fusion -count=1 -v -run 'TestLongRunHalfHour'
+# 全量（含 30 分钟长跑，约数分钟；建议不带 -race，回放量大时很慢）
+go test ./... -count=1 -v
+
 go run ./cmd/demo                 # 端到端回放演示
 ```

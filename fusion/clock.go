@@ -87,6 +87,8 @@ type clockModel struct {
 	lastAdopt   bool        // 上一次尝试是否采纳
 	firstSeen   int64       // 首次见到该路观测的统一时间（ns，相对原点）
 	hasFirst    bool        // 是否已记录 firstSeen
+	calSince    int64       // 最近一次 cold→calibrating（发现漂移证据）的参考时间（ns）
+	hasCalSince bool        // 是否已记录 calSince
 	sig         []sigSample // 该路近期信号窗口（原始时间坐标，有界）
 	lastRaw     float64     // 上一次位姿原始（缠绕）偏航，用于解卷绕
 }
@@ -446,26 +448,42 @@ func (a *Alignment) windowRateSpread(win sigWindow) float64 {
 }
 
 // lagSearchSkew 在给定 skew 下两级搜索最佳 lag，返回 (lag, 残差和, 命中)。
-func (a *Alignment) lagSearchSkew(win sigWindow, centerNS int64, skew, predLag, radius, acceptMeanSq float64) (int64, float64, bool) {
+// 搜索域为 pred 周围 radius，与 [clipLo,clipHi]（参考覆盖可行域）取交。
+func (a *Alignment) lagSearchSkew(win sigWindow, centerNS int64, skew, predLag, radius, clipLo, clipHi, acceptMeanSq float64) (int64, float64, bool) {
 	pred := int64(math.Round(predLag))
 	rad := int64(radius)
+	lo0, hi0 := pred-rad, pred+rad
+	if lo0 < int64(clipLo) {
+		lo0 = int64(clipLo)
+	}
+	if hi0 > int64(clipHi) {
+		hi0 = int64(clipHi)
+	}
 	best, bestCost := pred, math.Inf(1)
+	if pred < lo0 {
+		best = lo0
+	} else if pred > hi0 {
+		best = hi0
+	}
 	consider := func(lag int64) {
+		if lag < lo0 || lag > hi0 {
+			return
+		}
 		c, ok := a.windowCostSkew(centerNS, lag, skew, win)
 		if ok && (c < bestCost || (c == bestCost && abs64(lag) < abs64(best))) {
 			best, bestCost = lag, c
 		}
 	}
 	coarse := int64(lagCoarseStep)
-	for lag := pred - rad; lag <= pred+rad; lag += coarse {
+	for lag := lo0; lag <= hi0; lag += coarse {
 		consider(lag)
 	}
 	lo, hi := best-coarse, best+coarse
-	if lo < pred-rad {
-		lo = pred - rad
+	if lo < lo0 {
+		lo = lo0
 	}
-	if hi > pred+rad {
-		hi = pred + rad
+	if hi > hi0 {
+		hi = hi0
 	}
 	for lag := lo; lag <= hi; lag += int64(lagFineStep) {
 		consider(lag)
@@ -475,11 +493,12 @@ func (a *Alignment) lagSearchSkew(win sigWindow, centerNS int64, skew, predLag, 
 
 // admitResult / 对外判定。
 type admitResult struct {
-	ready   bool
-	reason  RejectReason
-	aligned time.Time
-	detail  string
-	ops     int // 本次判定的折算操作消耗（时延搜索等重操作）
+	ready    bool
+	reason   RejectReason
+	aligned  time.Time
+	detail   string
+	degraded bool // 以恒等映射“降级放行”（对齐未锁定但已过校准宽限）
+	ops      int  // 本次判定的折算操作消耗（时延搜索等重操作）
 }
 
 // Admit 摄入一条观测：参考路入信号环；非参考路按状态机更新时钟模型
@@ -538,10 +557,11 @@ func (a *Alignment) Admit(o Observation) admitResult {
 	}
 	ops := 1
 
-	// 锚点为“居中窗口”。为保证在该路时钟存在正偏移（原始戳超前统一
-	// 时间）时参考侧也已覆盖窗口远端，锚点相对到达延迟
-	// half+AlignSearchRange；此时无论真实偏移在搜索域内何处，统一时
-	// 间上的参考数据都已到齐。条件不足时 tryAnchorAt 返回 skipped。
+	// 锚点为“滞后居中窗口”。为保证该路时钟存在正偏移（原始戳超前统
+	// 一时间，lag>0）时、搜索域内任意候选 lag 所需的参考样本都已到齐，
+	// 锚点相对最新原始样本滞后 half+AlignSearchRange；此时无论真实偏
+	// 移在搜索域何处，统一时间上的参考窗口都已覆盖（参考不足时由
+	// tryAnchorAt 的可行域裁剪安全缩小搜索并 skipped，绝不误判）。
 	half := int64(a.halfWinFor(o.Kind))
 	anchorNS := ns - half - int64(a.cfg.AlignSearchRange)
 	// 锚点评估限频：校准期按 anchorEvalStride；一旦锁定且残差良好（零/
@@ -613,13 +633,23 @@ func (a *Alignment) tryAnchorAt(m *clockModel, kind SensorKind, anchorNS, half i
 	// 可行 lag 区间（使窗口整体落在参考覆盖 [refLo,refHi] 内）：
 	// refLo ≤ anchorNS+lag−half 且 anchorNS+lag+half ≤ refHi
 	// ⇒ lag ∈ [refLo−anchorNS+half, refHi−anchorNS−half]。
+	// 搜索域 = 可信半径 ∩ 可行区间；据此裁剪后，锚点只需滞后 half 即
+	// 可开始（不必再退整个搜索半径），缩短启动对齐延迟。
 	halfWin := half
 	refLo := a.refRing[0].tNS
 	refHi := a.refRing[len(a.refRing)-1].tNS
 	feasLo := refLo - anchorNS + halfWin
 	feasHi := refHi - anchorNS - halfWin
 	rad := int64(a.cfg.AlignSearchRange)
-	if feasHi < -rad || feasLo > rad {
+	clipLo := float64(-rad)
+	clipHi := float64(rad)
+	if float64(feasLo) > clipLo {
+		clipLo = float64(feasLo)
+	}
+	if float64(feasHi) < clipHi {
+		clipHi = float64(feasHi)
+	}
+	if clipHi < clipLo {
 		return 1, anchorSkipped // 搜索域与可行区间不相交
 	}
 	win, ok := buildSigWindow(m, anchorNS, half)
@@ -654,7 +684,7 @@ func (a *Alignment) tryAnchorAt(m *clockModel, kind SensorKind, anchorNS, half i
 		skewCenter = m.skew
 	}
 	coarseOnly := func(sk float64) (int64, float64) {
-		return a.lagCoarse(win, anchorNS, sk, float64(predLag), radF)
+		return a.lagCoarse(win, anchorNS, sk, float64(predLag), radF, clipLo, clipHi)
 	}
 	bestSkew, bestLag, bestCost := 1.0, int64(0), math.Inf(1)
 	probes := 0
@@ -682,7 +712,7 @@ func (a *Alignment) tryAnchorAt(m *clockModel, kind SensorKind, anchorNS, half i
 	skLo := bestSkew - skewCoarseStep
 	skHi := bestSkew + skewCoarseStep
 	for sk := skLo; sk <= skHi+1e-12; sk += skewFineStep {
-		lag, c, _ := a.lagSearchSkew(win, anchorNS, sk, float64(predLag), radF, trustSq)
+		lag, c, _ := a.lagSearchSkew(win, anchorNS, sk, float64(predLag), radF, clipLo, clipHi, trustSq)
 		if c < bestCost {
 			bestCost, bestSkew, bestLag = c, sk, lag
 		}
@@ -709,7 +739,7 @@ func (a *Alignment) tryAnchorAt(m *clockModel, kind SensorKind, anchorNS, half i
 	// 的情形。锁定后跳过（斜率由窄跟踪负责）。
 	if m.state != AlignLocked {
 		limited := bestCost
-		if dsk, dlag, dc, dok := a.diagSkew(win, anchorNS, radF, trustSq); dok &&
+		if dsk, dlag, dc, dok := a.diagSkew(win, anchorNS, radF, clipLo, clipHi, trustSq); dok &&
 			math.Abs(dsk-1) > a.cfg.AlignMaxSkew &&
 			dc/float64(len(win.t)) <= trustSq &&
 			dc < 0.5*limited {
@@ -725,11 +755,12 @@ func (a *Alignment) tryAnchorAt(m *clockModel, kind SensorKind, anchorNS, half i
 // diagSkew 在“诊断域”（可信范围再外扩一个 AlignMaxSkew）做粗扫，
 // 用于区分“斜率略超可信范围”(out_of_range) 与“完全无法对齐”
 // (calibrating)。超出诊断域的极端时钟不会在此被采纳，保持校准态。
-func (a *Alignment) diagSkew(win sigWindow, anchorNS int64, rad, trustSq float64) (float64, int64, float64, bool) {
+// lag 域裁剪到 [clipLo,clipHi]（参考覆盖可行域）。
+func (a *Alignment) diagSkew(win sigWindow, anchorNS int64, rad, clipLo, clipHi, trustSq float64) (float64, int64, float64, bool) {
 	bestSkew, bestLag, bestCost := 1.0, int64(0), math.Inf(1)
 	band := 2 * a.cfg.AlignMaxSkew
 	for sk := 1 - band; sk <= 1+band+1e-12; sk += skewCoarseStep {
-		lag, c := a.lagCoarse(win, anchorNS, sk, 0, rad)
+		lag, c := a.lagCoarse(win, anchorNS, sk, 0, rad, clipLo, clipHi)
 		if c < bestCost {
 			bestCost, bestSkew, bestLag = c, sk, lag
 		}
@@ -737,12 +768,25 @@ func (a *Alignment) diagSkew(win sigWindow, anchorNS int64, rad, trustSq float64
 	return bestSkew, bestLag, bestCost, bestCost < math.Inf(1)
 }
 
-// lagCoarse 只在粗 lag 网格上评估（供联合搜索的斜率粗扫描使用）。
-func (a *Alignment) lagCoarse(win sigWindow, centerNS int64, skew, predLag, radius float64) (int64, float64) {
+// lagCoarse 只在粗 lag 网格上评估（供联合搜索的斜率粗扫描使用），
+// 搜索域裁剪到 [clipLo,clipHi]（参考覆盖可行域）。
+func (a *Alignment) lagCoarse(win sigWindow, centerNS int64, skew, predLag, radius, clipLo, clipHi float64) (int64, float64) {
 	pred := int64(math.Round(predLag))
 	rad := int64(radius)
+	lo, hi := pred-rad, pred+rad
+	if lo < int64(clipLo) {
+		lo = int64(clipLo)
+	}
+	if hi > int64(clipHi) {
+		hi = int64(clipHi)
+	}
 	best, bestCost := pred, math.Inf(1)
-	for lag := pred - rad; lag <= pred+rad; lag += int64(lagCoarseStep) {
+	if pred < lo {
+		best = lo
+	} else if pred > hi {
+		best = hi
+	}
+	for lag := lo; lag <= hi; lag += int64(lagCoarseStep) {
 		c, ok := a.windowCostSkew(centerNS, lag, skew, win)
 		if ok && (c < bestCost || (c == bestCost && abs64(lag) < abs64(best))) {
 			best, bestCost = lag, c
@@ -751,60 +795,84 @@ func (a *Alignment) lagCoarse(win sigWindow, centerNS int64, skew, predLag, radi
 	return best, bestCost
 }
 
+// mapTimeNS 是“原始时间戳→统一时间”的唯一换算口径：优先使用近期已
+// 确认锚点的分段线性换算（锚点 lag 直接来自相关、且天然跟随时变漂
+// 移），跨度外短距外推；无锚点时退回仿射模型。verdict / Remap /
+// AlignedTime / 水线全部经此函数，保证“对外显示的时间”与“实际参与
+// 状态推进的时间”严格一致。
+func (a *Alignment) mapTimeNS(m *clockModel, x int64) int64 {
+	if y, ok := anchorsInterp(m, m.hist, x); ok {
+		return y
+	}
+	return a.applyModel(m, x)
+}
+
+// refNowNS 当前参考路前沿（统一时间，ns）；无参考样本时用 givenNS。
+func (a *Alignment) refNowNS(givenNS int64) int64 {
+	if len(a.refRing) > 0 {
+		return a.refRing[len(a.refRing)-1].tNS
+	}
+	return givenNS
+}
+
 // verdict 依据模型状态给出对齐判定。
+//
+// 状态机语义（显示什么口径，就一定按什么口径消费）：
+//   - cold：尚无任何漂移证据，按原始戳恒等放行——零漂移输入与关闭对
+//     齐逐位一致；
+//   - locked：锚点足够、残差/跨度/斜率/偏移均达标，按换算时间消费；
+//   - calibrating：已发现漂移证据但尚不可信，宽限（自发现证据起
+//     AlignCalibrateAfter）内观测暂缓（align_calibrating），绝不参与
+//     状态推进；超过宽限为不饿死滤波器，按原始戳恒等“降级放行”并
+//     标记 degraded（噪声膨胀），只有真正越界才持续拒绝；
+//   - out_of_range：映射超出可信范围，观测不采用（time_unavailable），
+//     也不进入待处理缓冲（避免越界数据在运行中无限堆积）。
 func (a *Alignment) verdict(m *clockModel, o Observation, ns int64) admitResult {
 	switch m.state {
 	case AlignLocked:
-		y := int64(0)
-		if yy, ok := anchorsInterp(m, m.hist, ns); ok {
-			y = yy
-		} else {
-			y = a.applyModel(m, ns)
-		}
+		y := a.mapTimeNS(m, ns)
 		return admitResult{ready: true, aligned: a.fromNS(y), detail: "aligned"}
 	case AlignOutOfRange:
 		return admitResult{ready: false, reason: ReasonTimeUnavailable,
 			aligned: o.Stamp, detail: "clock mapping skew/offset outside trusted range"}
-	default:
-		// 校准宽限降级：宽限按“当前参考统一时间 − 该路首次出现时刻”
-		// 计算（用观测自身时间会让旧挂起项永远落在宽限内、无法恢复）。
-		// 宽限内暂不采用；超过宽限仍未锁定则按原始时间恒等放行，避免饿死
-		// 融合；只有真正越界才持续拒绝。
-		grace := int64(a.cfg.AlignCalibrateAfter)
-		var now int64
-		if len(a.refRing) > 0 {
-			now = a.refRing[len(a.refRing)-1].tNS
-		} else {
-			now = ns
+	case AlignCold:
+		return admitResult{ready: true, aligned: o.Stamp, detail: "identity (no drift evidence)"}
+	default: // AlignCalibrating
+		now := a.refNowNS(ns)
+		since := m.firstSeen
+		if m.hasCalSince {
+			since = m.calSince
 		}
-		if !m.hasFirst || now-m.firstSeen <= grace {
+		if now-since <= int64(a.cfg.AlignCalibrateAfter) {
 			return admitResult{ready: false, reason: ReasonAlignCalibrating,
 				aligned: o.Stamp, detail: "collecting time-alignment anchors"}
 		}
-		return admitResult{ready: true, aligned: o.Stamp,
-			detail: "alignment untrusted after grace: identity fallback"}
+		return admitResult{ready: true, aligned: o.Stamp, degraded: true,
+			detail: "alignment untrusted after grace: degraded identity fallback"}
 	}
 }
 
-// DegradedSensors 返回因对齐不可信而处于“恒等降级”的路集合（已过
-// 校准宽限但仍未锁定、且未判越界）。
+// DegradedSensors 返回因对齐不可信而处于“恒等降级放行”的路集合
+// （已发现漂移证据、超过校准宽限但仍未锁定、且未判越界）。
 func (a *Alignment) DegradedSensors() map[SensorKind]bool {
 	out := make(map[SensorKind]bool)
 	for k, m := range a.models {
 		if a.refSet && k == a.ref {
 			continue
 		}
-		if m.state == AlignOutOfRange || m.state == AlignLocked {
+		if m.state != AlignCalibrating {
 			continue
 		}
-		if m.hasFirst {
-			last := int64(0)
-			if len(a.refRing) > 0 {
-				last = a.refRing[len(a.refRing)-1].tNS
-			}
-			if last-m.firstSeen > int64(a.cfg.AlignCalibrateAfter) {
-				out[k] = true
-			}
+		since := m.firstSeen
+		if m.hasCalSince {
+			since = m.calSince
+		}
+		now := int64(0)
+		if len(a.refRing) > 0 {
+			now = a.refRing[len(a.refRing)-1].tNS
+		}
+		if now-since > int64(a.cfg.AlignCalibrateAfter) {
+			out[k] = true
 		}
 	}
 	return out
@@ -833,18 +901,33 @@ func (a *Alignment) Remap(p pendingItem) pendingItem {
 		return p
 	}
 	m := a.models[p.kind]
-	if m == nil || (m.state == AlignCold && m.count == 0) {
-		p.aligned, p.ready = p.raw, m != nil && m.state == AlignCold
-		if m == nil {
-			p.ready = true
-		}
+	if m == nil {
+		p.aligned, p.ready = p.raw, true
 		return p
 	}
-	if m.state == AlignLocked {
-		p.aligned = a.fromNS(a.applyModel(m, a.relNS(p.raw)))
-		p.ready = true
-	} else {
-		p.aligned, p.ready = p.raw, false
+	switch m.state {
+	case AlignLocked:
+		p.aligned = a.fromNS(a.mapTimeNS(m, a.relNS(p.raw)))
+		p.ready, p.degraded = true, false
+	case AlignCold:
+		// 无漂移证据：恒等，且与关闭对齐同时刻口径一致。
+		p.aligned, p.ready, p.degraded = p.raw, true, false
+	case AlignOutOfRange:
+		// 越界口径不可信：永不放行。该类旧项会在水线越过其时间戳后被
+		// 陈旧护栏拒绝，从而离开缓冲，不会无限堆积。
+		p.aligned, p.ready, p.degraded = p.raw, false, false
+	default:
+		// calibrating：宽限内暂缓；超宽限后恒等降级放行。
+		now := a.refNowNS(a.relNS(p.raw))
+		since := m.firstSeen
+		if m.hasCalSince {
+			since = m.calSince
+		}
+		if now-since > int64(a.cfg.AlignCalibrateAfter) {
+			p.aligned, p.ready, p.degraded = p.raw, true, true
+		} else {
+			p.aligned, p.ready, p.degraded = p.raw, false, false
+		}
 	}
 	return p
 }
@@ -866,14 +949,7 @@ func (a *Alignment) AlignedTime(kind SensorKind, raw time.Time) (time.Time, bool
 		return time.Time{}, false
 	}
 	x := a.relNS(raw)
-	// 优先用近期确认锚点做分段线性换算：锚点 lag 直接来自相关、精度
-	// 高（毫秒级），局部斜率即相邻锚点斜率，避免全局单一 skew 在分段
-	// 漂移/噪声下的小偏差随时间线性累积。跨度内插值；跨度外用最近一段
-	// 斜率短距外推。
-	if y, ok := anchorsInterp(m, m.hist, x); ok {
-		return a.fromNS(y), true
-	}
-	return a.fromNS(a.applyModel(m, x)), true
+	return a.fromNS(a.mapTimeNS(m, x)), true
 }
 
 // anchorsInterp 在已按 x 排序的锚点上做分段线性换算，返回统一时间。
@@ -1058,10 +1134,11 @@ func (a *Alignment) refit(m *clockModel) {
 		// 正常锚点不足：若足够多的诊断锚点一致指向越界斜率，判
 		// out_of_range（区别于单纯样本不足的 calibrating）。
 		if a.diagOutOfRange(m.hist) {
-			m.state = AlignOutOfRange
-		} else if m.count > 0 && m.state == AlignCold {
-			m.state = AlignCalibrating
+			a.enterOutOfRange(m)
+			return
 		}
+		// 样本不足时不改变状态：cold 继续恒等（零漂移兼容的关键），
+		// calibrating 继续等样本。绝不因为“有了锚点”就离开 cold。
 		return
 	}
 	// 斜率直接取各锚点信号斜率比（sk）的中位数——它不经过 lag 量化，
@@ -1089,14 +1166,12 @@ func (a *Alignment) refit(m *clockModel) {
 	}
 	// 偏移与残差用近期确认锚点（对当前时延最具代表性）。
 	off, rms := fitOffset(confirmed, skew)
+	m.skew, m.offsetNS, m.residNS = skew, off, rms
 	// 越界边界检测：若足够多正常锚点的斜率都顶在可信边界附近（真实斜
 	// 率在域外、受限搜索被钳在边界），判 out_of_range。这能在无需精确
 	// 估计域外斜率的情况下可靠识别超界时钟。
 	if len(confirmed) >= minN && a.skewsAtBoundary(confirmed) {
-		m.state = AlignOutOfRange
-		m.skew = skew
-		m.offsetNS = off
-		m.residNS = rms
+		a.enterOutOfRange(m)
 		return
 	}
 	good := len(confirmed) >= minN &&
@@ -1104,11 +1179,8 @@ func (a *Alignment) refit(m *clockModel) {
 		rms <= float64(a.cfg.AlignTolerance) &&
 		math.Abs(skew-1) <= a.cfg.AlignMaxSkew &&
 		math.Abs(float64(off)) <= float64(a.cfg.AlignMaxDrift)
-	if good {
+	if good && a.driftEvidence(confirmed, skew, off) {
 		m.state = AlignLocked
-		m.skew = skew
-		m.offsetNS = off
-		m.residNS = rms
 		switch {
 		case off > int64(lagFineStep):
 			m.sign = 1
@@ -1119,16 +1191,59 @@ func (a *Alignment) refit(m *clockModel) {
 		}
 		return
 	}
-	outOfRange := math.Abs(skew-1) > a.cfg.AlignMaxSkew ||
-		math.Abs(float64(off)) > float64(a.cfg.AlignMaxDrift)
-	if outOfRange {
-		m.state = AlignOutOfRange
-	} else {
-		m.state = AlignCalibrating
+	if good {
+		// 锚点达标但统计上不支持存在显著漂移：保持 cold 恒等（零漂移
+		// 兼容），不做任何时间换算。
+		m.state = AlignCold
+		return
 	}
-	m.skew = skew
-	m.offsetNS = off
-	m.residNS = rms
+	if math.Abs(skew-1) > a.cfg.AlignMaxSkew ||
+		math.Abs(float64(off)) > float64(a.cfg.AlignMaxDrift) {
+		a.enterOutOfRange(m)
+		return
+	}
+	// 有足够锚点但残差/跨度尚不达标：只有当锚点统计上一致显示“存在
+	// 超过 AlignDetect 的时间偏差”时才进入 calibrating（观测暂缓）；
+	// 否则说明该路时间本来就自洽，继续 cold 恒等——这保证无漂移输入
+	// 下开关对齐逐位一致，也避免个别相关峰的毫秒级抖动误触发校准。
+	if !a.driftEvidence(confirmed, skew, off) {
+		m.state = AlignCold
+		return
+	}
+	a.enterCalibrating(m)
+}
+
+// driftEvidence 判定确认锚点是否统计一致地指向“真实存在、且超过检测
+// 门限 AlignDetect 的时间偏差”。单一相关峰受陀螺噪声积分/插值影响可
+// 能给出毫秒级假 lag（零漂移下约 ±10ms），因此要求锚点直接测得的
+// lag（y−x，即该时刻原始戳到统一时间的实际错位量）中位数超过门限。
+//
+// 注意不能只看仿射截距 off：它是“坐标原点处”的偏移，恒定斜率漂移在
+// 原点（回放起点）的 off 可以几乎为零，而实际错位 lag 已达数百毫秒并
+// 随时间增长——lag 中位数才是时间轴上真正的错位量。
+func (a *Alignment) driftEvidence(confirmed []clockPair, skew float64, offNS int64) bool {
+	lags := make([]float64, 0, len(confirmed))
+	for _, p := range confirmed {
+		lags = append(lags, float64(p.y-p.x))
+	}
+	return math.Abs(medianF(lags)) > float64(a.cfg.AlignDetect)
+}
+
+// enterCalibrating 进入校准态；cold→calibrating 的时刻用于校准宽限
+// 计时（宽限自“发现漂移证据”起算，而不是自该路第一次出现起算）。
+func (a *Alignment) enterCalibrating(m *clockModel) {
+	if m.state != AlignCalibrating {
+		m.state = AlignCalibrating
+		if len(a.refRing) > 0 {
+			m.calSince = a.refRing[len(a.refRing)-1].tNS
+			m.hasCalSince = true
+		}
+	}
+}
+
+// enterOutOfRange 进入越界态。
+func (a *Alignment) enterOutOfRange(m *clockModel) {
+	m.state = AlignOutOfRange
 }
 
 // Stats 返回各路对齐状态快照（含参考路）。
@@ -1159,45 +1274,39 @@ func (a *Alignment) frontierRaw(k SensorKind) (time.Time, bool) {
 	return t, ok
 }
 
-// watermark 返回可安全消费的统一时间水线（各路对齐覆盖交集）。
+// watermark 返回可安全消费的统一时间水线。
+//
+// 口径与 verdict/Remap 完全一致，避免“显示锁定却没按换算时间消费”：
+//   - 只有 locked 路参与水线交集（按 mapTimeNS 统一口径换算其原始前沿）；
+//   - cold（恒等）路不限制水线——观测按原始时间直接有序消费，与关闭
+//     对齐的既有行为一致；
+//   - calibrating / out_of_range 路也不冻结时间轴：它们的观测暂不采
+//     用（超宽限后 degraded 恒等放行），参考路与其他路继续推进，绝不
+//     允许一路未对齐把整条统一时间轴卡住；
+//   - 某 locked 路超过 DegradeAfter+AlignSearchRange 缺测时按暂时缺
+//     测处理（水线不再被它冻结），恢复后的迟到数据由陈旧规则拒绝。
 func (a *Alignment) watermark() (time.Time, bool) {
 	if !a.cfg.EnableAlignment || !a.refSet || len(a.refRing) == 0 {
 		return time.Time{}, false
 	}
 	margin := int64(a.cfg.AlignReleaseMargin)
 	wm := a.refRing[len(a.refRing)-1].tNS + margin
-	active := false
 	refFront := a.refRing[len(a.refRing)-1].tNS
 	for k, m := range a.models {
+		if k == a.ref || m.state != AlignLocked {
+			continue
+		}
 		raw, ok := a.frontier[k]
 		if !ok {
 			continue
 		}
-		active = true
-		// 某路超过“缺测宽限”(DegradeAfter+SearchRange) 未更新前沿时，
-		// 视为暂时缺测：水线不再被它冻结，避免一路长时间无数据挡住其他
-		// 路与参考的正常消费、撑爆待处理缓冲。
 		if refFront-a.relNS(raw) > int64(a.cfg.DegradeAfter)+int64(a.cfg.AlignSearchRange) {
 			continue
 		}
-		var lim int64
-		switch m.state {
-		case AlignLocked:
-			lim = a.applyModel(m, a.relNS(raw)) + margin
-		default:
-			// 校准/越界：用换算前沿（若有模型）否则原始前沿扣检测阈值。
-			if m.skew != 0 {
-				lim = a.applyModel(m, a.relNS(raw)) + margin
-			} else {
-				lim = a.relNS(raw) - int64(a.cfg.AlignDetect) + margin
-			}
-		}
+		lim := a.mapTimeNS(m, a.relNS(raw)) + margin
 		if lim < wm {
 			wm = lim
 		}
-	}
-	if !active {
-		wm = a.refRing[len(a.refRing)-1].tNS + margin
 	}
 	return a.fromNS(wm), true
 }
@@ -1211,11 +1320,12 @@ func abs64(v int64) int64 {
 
 // pendingItem 重排缓冲中的一条待消费观测。
 type pendingItem struct {
-	obs     Observation
-	aligned time.Time
-	raw     time.Time
-	ready   bool
-	kind    SensorKind
+	obs      Observation
+	aligned  time.Time
+	raw      time.Time
+	ready    bool
+	degraded bool // 对齐未锁定、超校准宽限后恒等降级放行
+	kind     SensorKind
 }
 
 // alignCheckpoint 对齐层深拷贝检查点（批预算失败时整批回滚）。
@@ -1247,6 +1357,7 @@ func (a *Alignment) Checkpoint() alignCheckpoint {
 			pairs: append([]clockPair(nil), m.pairs...), hist: append([]clockPair(nil), m.hist...), count: m.count,
 			sign: m.sign, lastAnch: m.lastAnch, hasLastAnch: m.hasLastAnch, anchoredAt: m.anchoredAt, lastAdopt: m.lastAdopt,
 			firstSeen: m.firstSeen, hasFirst: m.hasFirst,
+			calSince: m.calSince, hasCalSince: m.hasCalSince,
 			sig: append([]sigSample(nil), m.sig...),
 		}
 	}
