@@ -114,6 +114,7 @@ type Alignment struct {
 	refHasYaw bool
 	models    map[SensorKind]*clockModel
 	frontier  map[SensorKind]time.Time
+	draining  bool // AdvanceTo 排空口径：允许半窗右外推，放出暂缓尾部
 }
 
 // NewAlignment 创建在线时间对齐层。
@@ -605,10 +606,17 @@ func (a *Alignment) tryAnchorAt(m *clockModel, kind SensorKind, anchorNS, half i
 	if len(a.refRing) < 8 {
 		return 1, anchorSkipped
 	}
-	// 预测当前 lag：冷启动为 0；已锁定时按仿射外推（y−x）。
+	// 预测当前 lag：冷启动为 0；已锁定时必须用“锚点分段换算”预测，而不是
+	// 全局仿射 applyModel。全局仿射 unified=skew·raw+offset 的 skew/offset
+	// 是相对同步原点拟合的，在远离原点（raw 很大）时 (skew−1)·raw 项会把
+	// 预测 lag 放大到数秒（即便真实当前 lag 接近 0），把搜索中心带偏到可
+	// 行域边缘的假峰；分段锚点直接给出当前时刻附近的 lag(y−x)，是正确、
+	// 有界的预测。
 	predLag := int64(0)
 	if m.state == AlignLocked {
-		predLag = a.applyModel(m, anchorNS) - anchorNS
+		if y, ok := anchorsInterp(m, m.hist, anchorNS); ok {
+			predLag = y - anchorNS
+		}
 	}
 	// 可行 lag 区间（使窗口整体落在参考覆盖 [refLo,refHi] 内）：
 	// refLo ≤ anchorNS+lag−half 且 anchorNS+lag+half ≤ refHi
@@ -620,7 +628,7 @@ func (a *Alignment) tryAnchorAt(m *clockModel, kind SensorKind, anchorNS, half i
 	feasHi := refHi - anchorNS - halfWin
 	rad := int64(a.cfg.AlignSearchRange)
 	if feasHi < -rad || feasLo > rad {
-		return 1, anchorSkipped // 搜索域与可行区间不相交
+		return 1, anchorSkipped
 	}
 	win, ok := buildSigWindow(m, anchorNS, half)
 	if !ok {
@@ -751,39 +759,132 @@ func (a *Alignment) lagCoarse(win sigWindow, centerNS int64, skew, predLag, radi
 	return best, bestCost
 }
 
-// verdict 依据模型状态给出对齐判定。
-func (a *Alignment) verdict(m *clockModel, o Observation, ns int64) admitResult {
+// mapRawNS 把某路原始相对时间 x 换算到统一时间轴，返回 (统一时间,
+// 是否可按已对齐/恒等身份采用)。所有对外口径——判定、待定项重算、
+// 对齐水线、AlignedTime——必须走这里，确保“显示用什么时间、融合就
+// 真的用什么时间”，避免同一观测在不同批次被重算成不同时间。
+//
+//   - locked：用近期确认锚点分段换算（局部斜率，能跟时变漂移）。向左
+//     （早于最早锚点，即锁定瞬间被暂缓的启动段）与向右（晚于最新锚点的
+//     当前前沿，稳态常态）都允许半窗量级短距外推；锚点持续到达，稳态右
+//     外推可靠。启动段向左的正确性由“锁定前该路数据暂缓、水线压住参考”
+//     保证——锁定瞬间这些点统一时间一致、用全局稳健仿射换算即可，不会
+//     出现跨数百毫秒的错位（时钟在同步原点一致、斜率接近 1）；
+//   - cold：未发现漂移，严格恒等（零漂移行为与关闭对齐逐位一致）；
+//   - calibrating / out_of_range：不可采用，由调用方决定暂缓/拒绝。
+func (a *Alignment) mapRawNS(m *clockModel, x int64) (int64, bool) {
 	switch m.state {
 	case AlignLocked:
-		y := int64(0)
-		if yy, ok := anchorsInterp(m, m.hist, ns); ok {
-			y = yy
-		} else {
-			y = a.applyModel(m, ns)
+		if y, ok := anchorsInterp(m, m.hist, x); ok {
+			return y, true
+		}
+		return a.applyModel(m, x), true
+	case AlignCold:
+		return x, true
+	default:
+		return 0, false
+	}
+}
+
+// mapStrictNS 是“在线消费”口径：除 mapRawNS 的规则外，locked 路只放行
+// 原始时间不晚于“最新已采纳锚点 + 半窗”的观测。
+//
+// 锚点之间的插值由已采纳（不可变）锚点唯一确定，换算随后续数据不会再变；
+// 最新锚点之后只允许半窗（相关居中窗宽度）短距右外推，误差有界（真实斜率
+// 偏离 1 很小，半窗外推仅十几毫秒）且下个锚点很快把它夹住。更晚的点要靠
+// 段斜率长距外推，该斜率每来新锚点都可能变——若这种点已被消费，新锚点会
+// 让同一观测换算时间回跳（负 dt、把未来速度/位姿配到过去姿态），对高频
+// 速度更新经 IMU 积分正反馈放大、在漂移换向点尤其致命。故更晚的点在线暂
+// 缓；离线追平由 AdvanceTo 的排空口径（允许更大右外推）处理。
+func (a *Alignment) mapStrictNS(m *clockModel, x int64) (int64, bool) {
+	if m.state == AlignLocked {
+		if _, hi, cov := a.anchorCoverage(m); cov {
+			slack := int64(a.halfWinFor(a.strictKind(m)))
+			if x > hi+slack {
+				return 0, false
+			}
+		}
+	}
+	return a.mapRawNS(m, x)
+}
+
+// strictKind 从模型反查路别（仅用于按路选相关半窗）。模型数量很少，线性
+// 扫描即可。
+func (a *Alignment) strictKind(m *clockModel) SensorKind {
+	for k := SensorIMU; k <= SensorAbsolutePose; k++ {
+		if a.models[k] == m {
+			return k
+		}
+	}
+	return SensorOdometry
+}
+
+// anchorCoverage 返回该路正常（非诊断）已采纳锚点在原始时间轴上的覆盖
+// 区间 [lo,hi]。hist 按追加顺序保存，正常点未必严格有序，取最小/最大。
+func (a *Alignment) anchorCoverage(m *clockModel) (int64, int64, bool) {
+	lo, hi, set := int64(0), int64(0), false
+	for _, p := range m.hist {
+		if p.diag {
+			continue
+		}
+		if !set {
+			lo, hi, set = p.x, p.x, true
+			continue
+		}
+		if p.x < lo {
+			lo = p.x
+		}
+		if p.x > hi {
+			hi = p.x
+		}
+	}
+	return lo, hi, set
+}
+
+// mapForConsume 选择消费口径：在线摄入（draining=false）走严格口径
+// （只放出已被锚点夹住、换算永不回跳的点）；AdvanceTo 排空（draining=true）
+// 走宽松口径（允许半窗右外推，把暂缓尾部一次放出）。
+func (a *Alignment) mapForConsume(m *clockModel, x int64) (int64, bool) {
+	if a.draining {
+		return a.mapRawNS(m, x)
+	}
+	return a.mapStrictNS(m, x)
+}
+
+// SetDraining 设置/解除排空口径（由引擎在 AdvanceTo 排空前后切换）。
+func (a *Alignment) SetDraining(on bool) { a.draining = on }
+
+// verdict 依据模型状态给出对齐判定。
+func (a *Alignment) verdict(m *clockModel, o Observation, ns int64) admitResult {
+	if y, ok := a.mapForConsume(m, ns); ok {
+		if m.state == AlignCold {
+			// 未发现漂移：恒等采用，与关闭对齐完全一致。
+			return admitResult{ready: true, aligned: o.Stamp, detail: "identity: no drift detected"}
 		}
 		return admitResult{ready: true, aligned: a.fromNS(y), detail: "aligned"}
-	case AlignOutOfRange:
+	}
+	if m.state == AlignOutOfRange {
 		return admitResult{ready: false, reason: ReasonTimeUnavailable,
 			aligned: o.Stamp, detail: "clock mapping skew/offset outside trusted range"}
-	default:
-		// 校准宽限降级：宽限按“当前参考统一时间 − 该路首次出现时刻”
-		// 计算（用观测自身时间会让旧挂起项永远落在宽限内、无法恢复）。
-		// 宽限内暂不采用；超过宽限仍未锁定则按原始时间恒等放行，避免饿死
-		// 融合；只有真正越界才持续拒绝。
-		grace := int64(a.cfg.AlignCalibrateAfter)
-		var now int64
-		if len(a.refRing) > 0 {
-			now = a.refRing[len(a.refRing)-1].tNS
-		} else {
-			now = ns
-		}
-		if !m.hasFirst || now-m.firstSeen <= grace {
-			return admitResult{ready: false, reason: ReasonAlignCalibrating,
-				aligned: o.Stamp, detail: "collecting time-alignment anchors"}
-		}
-		return admitResult{ready: true, aligned: o.Stamp,
-			detail: "alignment untrusted after grace: identity fallback"}
 	}
+	// 校准宽限降级：宽限按“当前参考统一时间 − 该路首次出现时刻”
+	// 计算（用观测自身时间会让旧挂起项永远落在宽限内、无法恢复）。
+	// 宽限内暂不采用（原因明确为样本不足）；超过宽限仍未锁定则按原始
+	// 时间恒等放行并显式标记为“未对齐降级”，避免饿死融合；只有真正
+	// 越界才持续拒绝。
+	grace := int64(a.cfg.AlignCalibrateAfter)
+	var now int64
+	if len(a.refRing) > 0 {
+		now = a.refRing[len(a.refRing)-1].tNS
+	} else {
+		now = ns
+	}
+	if !m.hasFirst || now-m.firstSeen <= grace {
+		return admitResult{ready: false, reason: ReasonAlignCalibrating,
+			aligned: o.Stamp, detail: "collecting time-alignment anchors"}
+	}
+	return admitResult{ready: true, aligned: o.Stamp, reason: ReasonAlignDegraded,
+		detail: "alignment untrusted after grace: identity fallback"}
 }
 
 // DegradedSensors 返回因对齐不可信而处于“恒等降级”的路集合（已过
@@ -826,25 +927,32 @@ func (a *Alignment) Retry(p pendingItem) (admitResult, bool) {
 	return r, r.ready
 }
 
-// Remap 用当前模型重算待定项的对齐时间与就绪状态。
+// Remap 用当前模型重算待定项的对齐时间与就绪状态。口径与 verdict
+// 完全一致（都走 mapForConsume），保证同一条观测在“暂缓重判”和“缓冲
+// 重算”两条路径上得到相同的统一时间，不会每批跳动；校准宽限后的恒等
+// 降级放行也在此一致生效（带 alignFallback 标记）。
 func (a *Alignment) Remap(p pendingItem) pendingItem {
 	if !a.cfg.EnableAlignment || p.kind == a.ref {
 		p.aligned, p.ready = p.raw, true
 		return p
 	}
 	m := a.models[p.kind]
-	if m == nil || (m.state == AlignCold && m.count == 0) {
-		p.aligned, p.ready = p.raw, m != nil && m.state == AlignCold
-		if m == nil {
-			p.ready = true
-		}
+	if m == nil {
+		// 尚未建立任何模型：按恒等采用（零漂移兼容），绝不挂起。
+		p.aligned, p.ready = p.raw, true
 		return p
 	}
-	if m.state == AlignLocked {
-		p.aligned = a.fromNS(a.applyModel(m, a.relNS(p.raw)))
+	// 直接复用 verdict：同一观测在“暂缓重判”与“缓冲重算”两条路径上的
+	// 就绪/换算/降级口径必须完全一致。
+	r := a.verdict(m, p.obs, a.relNS(p.raw))
+	if r.ready {
 		p.ready = true
+		p.aligned = r.aligned
+		p.alignFallback = r.reason == ReasonAlignDegraded
 	} else {
-		p.aligned, p.ready = p.raw, false
+		p.ready = false
+		p.aligned = p.raw
+		p.alignFallback = false
 	}
 	return p
 }
@@ -862,24 +970,30 @@ func (a *Alignment) AlignedTime(kind SensorKind, raw time.Time) (time.Time, bool
 		return raw, true
 	}
 	m, ok := a.models[kind]
-	if !ok || m.state != AlignLocked {
-		return time.Time{}, false
+	if !ok {
+		// 从未建立模型：恒等（零漂移兼容）。
+		return raw, true
 	}
 	x := a.relNS(raw)
-	// 优先用近期确认锚点做分段线性换算：锚点 lag 直接来自相关、精度
-	// 高（毫秒级），局部斜率即相邻锚点斜率，避免全局单一 skew 在分段
-	// 漂移/噪声下的小偏差随时间线性累积。跨度内插值；跨度外用最近一段
-	// 斜率短距外推。
-	if y, ok := anchorsInterp(m, m.hist, x); ok {
-		return a.fromNS(y), true
+	switch m.state {
+	case AlignLocked:
+		if y, ok := anchorsInterp(m, m.hist, x); ok {
+			return a.fromNS(y), true
+		}
+		return a.fromNS(a.applyModel(m, x)), true
+	case AlignCold:
+		// 未发现漂移：恒等。
+		return raw, true
+	default:
+		// calibrating / out_of_range：不可信，不提供换算。
+		return time.Time{}, false
 	}
-	return a.fromNS(a.applyModel(m, x)), true
 }
 
 // anchorsInterp 在已按 x 排序的锚点上做分段线性换算，返回统一时间。
-// 分段斜率被钳在全局 skew 的 ±segSlopeBand 内，避免单个异常锚点或
-// 漂移分段切换点附近的相邻锚点产生极端斜率；跨度内插值，跨度外用最
-// 近一段（钳制后）短距外推。
+// 分段斜率只钳到以 1 为中心的紧绝对带（剔除异常锚点极端斜率），不
+// 依赖滞后的全局 skew，因此能即时跟上漂移换向；跨度内插值，跨度外用最
+// 近一段短距外推。
 func anchorsInterp(m *clockModel, ps0 []clockPair, x int64) (int64, bool) {
 	// 仅用正常采纳的锚点（排除越界诊断锚点），且按 x 排序。
 	ps := make([]clockPair, 0, len(ps0))
@@ -891,8 +1005,12 @@ func anchorsInterp(m *clockModel, ps0 []clockPair, x int64) (int64, bool) {
 	sort.Slice(ps, func(i, j int) bool { return ps[i].x < ps[j].x })
 	seg := func(a, b clockPair) float64 {
 		s := segSlope(a, b)
-		// 钳制到全局稳健斜率附近，抑制切换点/异常锚点的极端段斜率。
-		lo, hi := m.skew-segSlopeBand, m.skew+segSlopeBand
+		// 钳到“以 1 为中心的紧绝对带”[1±segSlopeAbsBand]：带宽略大于锚点
+		// 相关噪声造成的段斜率抖动，用于剔除异常锚点的极端段斜率；它不跟随
+		// 滞后的全局稳健斜率 m.skew——漂移换向时 m.skew 仍反映换向前段，若
+		// 以它为中心钳制会强制局部段映射偏向错误方向并正反馈发散。固定以 1
+		// 为中心，真实的 ±0.3% 段斜率可自由通过，又能即时跟上换向。
+		lo, hi := 1-segSlopeAbsBand, 1+segSlopeAbsBand
 		if s < lo {
 			s = lo
 		}
@@ -905,6 +1023,7 @@ func anchorsInterp(m *clockModel, ps0 []clockPair, x int64) (int64, bool) {
 		return 0, false
 	}
 	if len(ps) == 1 {
+		// 单锚点：锚点之外一律保持当前 lag（斜率 1），不凭单锚点斜率外推。
 		return ps[0].y + (x - ps[0].x), true
 	}
 	if x <= ps[0].x {
@@ -922,8 +1041,10 @@ func anchorsInterp(m *clockModel, ps0 []clockPair, x int64) (int64, bool) {
 	return int64(math.Round(float64(lo.y) + s*float64(x-lo.x))), true
 }
 
-// segSlopeBand 分段斜率相对全局稳健斜率允许的最大偏离（绝对值）。
-const segSlopeBand = 0.01
+// segSlopeAbsBand 分段斜率相对 1 的绝对钳制带宽：略大于相关噪声造成的
+// 段斜率抖动（真实测试漂移斜率在 ±0.3% 内），用于剔除异常锚点极端斜率，
+// 又不依赖滞后的全局斜率，保证换向时局部段可自由取到真实斜率。
+const segSlopeAbsBand = 0.01
 
 func segSlope(a, b clockPair) float64 {
 	dx := float64(b.x - a.x)
@@ -1047,6 +1168,47 @@ func fitOffset(ps []clockPair, skew float64) (int64, float64) {
 	return int64(math.Round(off)), math.Sqrt(ss / float64(len(ps)))
 }
 
+// lagConsensus 判断近期确认锚点的 lag(y−x) 是否“同号一致”：取 lag
+// 中位数的符号为候选方向，要求至少 2/3 的锚点与该方向同号，且同号锚点
+// 的 lag 中位数幅值超过 detect。零均值相关噪声符号近半翻转、过不了该
+// 一致性；真实时钟跑偏的 lag 持续同号，轻松通过。
+func lagConsensus(ps []clockPair, detect int64) bool {
+	lag, ok := consensusLag(ps)
+	return ok && math.Abs(lag) > float64(detect)
+}
+
+// consensusLag 返回近期确认锚点“同号一致”的实测时钟偏移中位数
+// （单位 ns，即 lag=y−x，直接就是 unified−raw 当前偏移量，与拟合斜率
+// 无关）。取 lag 中位数符号为候选方向，要求至少 2/3 锚点同号；否则
+// 返回 ok=false（偏移方向不一致，判为噪声而非漂移）。
+func consensusLag(ps []clockPair) (float64, bool) {
+	if len(ps) < 3 {
+		return 0, false
+	}
+	lag := make([]float64, len(ps))
+	for i, p := range ps {
+		lag[i] = float64(p.y - p.x)
+	}
+	med := medianF(lag)
+	if med == 0 {
+		return 0, false
+	}
+	dir := 1.0
+	if med < 0 {
+		dir = -1.0
+	}
+	same := make([]float64, 0, len(ps))
+	for _, l := range lag {
+		if dir*l > 0 {
+			same = append(same, l)
+		}
+	}
+	if len(same)*3 < len(ps)*2 {
+		return 0, false
+	}
+	return medianF(same), true
+}
+
 func (a *Alignment) refit(m *clockModel) {
 	if len(m.pairs) == 0 && len(m.hist) == 0 {
 		return
@@ -1054,14 +1216,21 @@ func (a *Alignment) refit(m *clockModel) {
 	confirmed := a.confirmedPairs(m, m.pairs)
 	histConf := a.confirmedPairs(m, m.hist)
 	minN := a.cfg.AlignMinSamples
+
+	// 正常锚点不足。cold 态必须保守：在拿到足够多“一致且显著”的漂移
+	// 证据前保持恒等（零漂移输入下相关 lag 只是 ±20ms 噪声，绝不能据此
+	// 进入校准态暂缓数据，否则会改变既有融合行为）。只有诊断锚点一致
+	// 指向越界斜率时才判 out_of_range。
 	if len(confirmed) < minN {
-		// 正常锚点不足：若足够多的诊断锚点一致指向越界斜率，判
-		// out_of_range（区别于单纯样本不足的 calibrating）。
 		if a.diagOutOfRange(m.hist) {
 			m.state = AlignOutOfRange
-		} else if m.count > 0 && m.state == AlignCold {
-			m.state = AlignCalibrating
+			return
 		}
+		if m.state == AlignCold {
+			// 证据不足：维持恒等，不暂缓、不改映射。
+			return
+		}
+		// calibrating 态保持校准，等待更多锚点。
 		return
 	}
 	// 斜率直接取各锚点信号斜率比（sk）的中位数——它不经过 lag 量化，
@@ -1082,37 +1251,48 @@ func (a *Alignment) refit(m *clockModel) {
 		}
 	}
 	skew := m.skew
+	if skew == 0 {
+		skew = 1
+	}
 	if len(sks) >= minN {
 		skew = medianF(sks)
-	} else if m.skew == 0 {
-		skew = 1
 	}
 	// 偏移与残差用近期确认锚点（对当前时延最具代表性）。
 	off, rms := fitOffset(confirmed, skew)
 	// 越界边界检测：若足够多正常锚点的斜率都顶在可信边界附近（真实斜
 	// 率在域外、受限搜索被钳在边界），判 out_of_range。这能在无需精确
 	// 估计域外斜率的情况下可靠识别超界时钟。
-	if len(confirmed) >= minN && a.skewsAtBoundary(confirmed) {
+	if a.skewsAtBoundary(confirmed) {
 		m.state = AlignOutOfRange
 		m.skew = skew
 		m.offsetNS = off
 		m.residNS = rms
 		return
 	}
-	good := len(confirmed) >= minN &&
-		span >= int64(a.cfg.AlignMinSpan) &&
+	// 漂移判定直接用“锚点实测当前偏移”consensusLag（lag=y−x 的同号
+	// 中位数），而不是仿射截距 off：在远离原点（x 很大）时斜率与截距强
+	// 相关，拟合会把真实偏移吸收进斜率、使 off≈0（即便 lag 已达 0.8s），
+	// 用 off 判漂移必然漏检。lag 直接就是 unified−raw 的当前偏移量，且
+	// 要求同号一致（零漂移的零均值相关噪声符号近半翻转，过不了）。这保证
+	// 零漂移永不离开恒等（与关闭对齐逐位一致），真实固定偏置/斜率跑偏都
+	// 会迅速锁定；已锁定路若 lag 回落、一致性消失，同样退回恒等。
+	detect := int64(a.cfg.AlignDetect)
+	cl, consensus := consensusLag(confirmed)
+	driftSeen := consensus && math.Abs(cl) > float64(detect)
+	curLag := int64(math.Round(cl))
+	good := span >= int64(a.cfg.AlignMinSpan) &&
 		rms <= float64(a.cfg.AlignTolerance) &&
 		math.Abs(skew-1) <= a.cfg.AlignMaxSkew &&
-		math.Abs(float64(off)) <= float64(a.cfg.AlignMaxDrift)
-	if good {
+		math.Abs(float64(curLag)) <= float64(int64(a.cfg.AlignMaxDrift))
+	if good && driftSeen {
 		m.state = AlignLocked
 		m.skew = skew
 		m.offsetNS = off
 		m.residNS = rms
 		switch {
-		case off > int64(lagFineStep):
+		case curLag > int64(lagFineStep):
 			m.sign = 1
-		case off < -int64(lagFineStep):
+		case curLag < -int64(lagFineStep):
 			m.sign = -1
 		default:
 			m.sign = 0
@@ -1120,11 +1300,16 @@ func (a *Alignment) refit(m *clockModel) {
 		return
 	}
 	outOfRange := math.Abs(skew-1) > a.cfg.AlignMaxSkew ||
-		math.Abs(float64(off)) > float64(a.cfg.AlignMaxDrift)
-	if outOfRange {
+		(consensus && math.Abs(cl) > float64(int64(a.cfg.AlignMaxDrift)))
+	switch {
+	case outOfRange:
 		m.state = AlignOutOfRange
-	} else {
+	case driftSeen:
+		// 已发现真实漂移但尚未拟合达标：暂缓，样本不足原因可区分。
 		m.state = AlignCalibrating
+	default:
+		// 残差/跨度暂不达标但无显著漂移证据：保持恒等（兼容）。
+		m.state = AlignCold
 	}
 	m.skew = skew
 	m.offsetNS = off
@@ -1160,44 +1345,74 @@ func (a *Alignment) frontierRaw(k SensorKind) (time.Time, bool) {
 }
 
 // watermark 返回可安全消费的统一时间水线（各路对齐覆盖交集）。
+//
+// 口径必须与“实际消费时的换算”一致：
+//   - locked：用统一换算后的该路前沿（mapRawNS）；
+//   - cold（未发现漂移，恒等）：用原始前沿；
+//   - calibrating（已发现漂移、样本不足）：这一路的数据正在暂缓，为不
+//     让参考路（恒等、始终就绪）独自冲到前面、将来放出的旧观测全部陈旧，
+//     用“原始前沿 − 搜索半径”保守约束参考消费，使时间轴在该路对齐期间
+//     短暂等待而不是被带偏；该路缺测超过 DegradeAfter+SearchRange 后
+//     解除约束，避免单路缺测冻结整条时间轴；
+//   - out_of_range：观测持续拒绝，不参与交集（超时后），避免卡死。
 func (a *Alignment) watermark() (time.Time, bool) {
 	if !a.cfg.EnableAlignment || !a.refSet || len(a.refRing) == 0 {
 		return time.Time{}, false
 	}
 	margin := int64(a.cfg.AlignReleaseMargin)
-	wm := a.refRing[len(a.refRing)-1].tNS + margin
-	active := false
 	refFront := a.refRing[len(a.refRing)-1].tNS
+	wm := refFront + margin
+	active := false
+	constrained := false // 是否存在真正需要约束消费的（非恒等）路
 	for k, m := range a.models {
 		raw, ok := a.frontier[k]
 		if !ok {
 			continue
 		}
 		active = true
+		// cold（未发现漂移）恒等路与参考轴同口径，不需水线；锁定路与
+		// 校准/越界路都约束参考放水——保证参考 IMU 不致跑到非参考路“已确认
+		// 覆盖到的统一时间”之前（否则启动/校准段的速度、位姿更新会因姿态
+		// 尚未对齐而错配）。
+		if m.state == AlignCold {
+			continue
+		}
+		constrained = true
+		rawNS := a.relNS(raw)
 		// 某路超过“缺测宽限”(DegradeAfter+SearchRange) 未更新前沿时，
 		// 视为暂时缺测：水线不再被它冻结，避免一路长时间无数据挡住其他
 		// 路与参考的正常消费、撑爆待处理缓冲。
-		if refFront-a.relNS(raw) > int64(a.cfg.DegradeAfter)+int64(a.cfg.AlignSearchRange) {
+		missingFor := refFront - rawNS
+		missingLimit := int64(a.cfg.DegradeAfter) + int64(a.cfg.AlignSearchRange)
+		if missingFor > missingLimit {
 			continue
 		}
 		var lim int64
 		switch m.state {
 		case AlignLocked:
-			lim = a.applyModel(m, a.relNS(raw)) + margin
-		default:
-			// 校准/越界：用换算前沿（若有模型）否则原始前沿扣检测阈值。
-			if m.skew != 0 {
-				lim = a.applyModel(m, a.relNS(raw)) + margin
+			// 放水上界 = 最新已采纳锚点的统一时间 + 半窗。锚点之间的插值
+			// 不可变、绝不回跳；最新锚点之后只允许半窗（相关居中窗宽度）的
+			// 短距右外推——其误差有界（真实斜率 ±0.5% × 2.5s ≈ 12ms 量级），
+			// 且下个锚点很快把它夹住。再远的点在线先暂缓（由后续批次或
+			// AdvanceTo 排空），避免用会随新锚点改变的段斜率长距外推，在漂移
+			// 换向点错配高频速度更新而正反馈发散。
+			if _, hy, cov := a.anchorCoverage(m); cov {
+				lim = hy + int64(a.halfWinFor(k)) + margin
 			} else {
-				lim = a.relNS(raw) - int64(a.cfg.AlignDetect) + margin
+				lim = rawNS - int64(a.cfg.AlignSearchRange) + margin
 			}
+		default:
+			// calibrating / out_of_range：该路观测暂缓或拒绝。用保守原始
+			// 前沿约束参考（不按未校准模型外推），防止参考跑过头。
+			lim = rawNS - int64(a.cfg.AlignSearchRange) + margin
 		}
 		if lim < wm {
 			wm = lim
 		}
 	}
-	if !active {
-		wm = a.refRing[len(a.refRing)-1].tNS + margin
+	if !active || !constrained {
+		// 没有非恒等路：零漂移/全 cold，行为与关闭对齐一致（全序即时消费）。
+		wm = refFront + margin
 	}
 	return a.fromNS(wm), true
 }
@@ -1211,11 +1426,12 @@ func abs64(v int64) int64 {
 
 // pendingItem 重排缓冲中的一条待消费观测。
 type pendingItem struct {
-	obs     Observation
-	aligned time.Time
-	raw     time.Time
-	ready   bool
-	kind    SensorKind
+	obs           Observation
+	aligned       time.Time
+	raw           time.Time
+	ready         bool
+	kind          SensorKind
+	alignFallback bool // 校准宽限后未锁定，按原始时间恒等降级放行
 }
 
 // alignCheckpoint 对齐层深拷贝检查点（批预算失败时整批回滚）。

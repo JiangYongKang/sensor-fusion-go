@@ -209,6 +209,52 @@ func runDrift(t *testing.T, cfg ReplayConfig, ec Config) *Engine {
 	return eng
 }
 
+// ingestAndDrain 分批摄入全部观测，末尾 AdvanceTo 到最晚观测时刻排空（不
+// 再多纯预测），返回引擎与真值轨迹起点。
+func ingestAndDrain(obs []Observation, ec Config, bs int) *Engine {
+	eng := NewEngine(ec)
+	for i := 0; i < len(obs); i += bs {
+		end := i + bs
+		if end > len(obs) {
+			end = len(obs)
+		}
+		eng.Ingest(obs[i:end])
+	}
+	end := obs[0].Stamp
+	for _, o := range obs {
+		if o.Stamp.After(end) {
+			end = o.Stamp
+		}
+	}
+	eng.AdvanceTo(end)
+	return eng
+}
+
+// boundedReversalClocks 构造一组全程“偏移有界、斜率在运行中反复换向”的
+// 多路时钟曲线：位姿/里程计各用 6 段斜率（每段 5 分钟），偏移量在整个半
+// 小时内始终有界（峰值 <1s）、不会无限累积到搜索范围之外。用于长跑回归。
+func boundedReversalClocks() map[SensorKind]ClockProfile {
+	seg := 5 * time.Minute
+	segs := func(n int) []time.Duration {
+		out := make([]time.Duration, n)
+		for i := range out {
+			out[i] = seg
+		}
+		return out
+	}
+	return map[SensorKind]ClockProfile{
+		// 位姿：+0.3% / −0.3% 交替，偏移在 0..+0.9s 间有界振荡。
+		SensorOdometry: {
+			Slopes:   []float64{0.9985, 1.002, 1.0005, 0.999, 1.002, 0.998},
+			Segments: segs(6), Offset0: -150 * time.Millisecond,
+		},
+		SensorAbsolutePose: {
+			Slopes:   []float64{1.003, 0.997, 1.003, 0.997, 1.003, 0.997},
+			Segments: segs(6), Offset0: 300 * time.Millisecond,
+		},
+	}
+}
+
 func statOf(eng *Engine, k SensorKind) AlignStat {
 	for _, s := range eng.AlignmentStats() {
 		if s.Kind == k {
@@ -587,5 +633,151 @@ func TestLongRunHalfHour(t *testing.T) {
 	}
 	if rotErr > 0.5 {
 		t.Fatalf("长跑末端姿态误差过大: %.4frad", rotErr)
+	}
+}
+
+// endErr 在“状态时刻对应的时变激励真值”上评估末端位置误差与速度范数。
+func endErr(eng *Engine) (float64, float64) {
+	start := time.Unix(1_700_000_000, 0)
+	ex := ExcitedTrajectory(start)
+	s, _, ok := eng.Snapshot()
+	if !ok {
+		return math.Inf(1), math.Inf(1)
+	}
+	return vecNorm(vecSub(s.Position, ex.PoseAt(s.Stamp).Position)), vecNorm(s.Velocity)
+}
+
+// TestAlignmentNoDriftBitIdentical 无时钟漂移输入下，开启与关闭在线对齐
+// 必须得到逐位一致的融合结果（位置/速度），跨多 seed、多时长。这是“对齐
+// 层对既有行为零影响”的硬兼容保证。
+func TestAlignmentNoDriftBitIdentical(t *testing.T) {
+	for _, dur := range []time.Duration{30 * time.Second, 3 * time.Minute} {
+		for _, seed := range []int64{11, 23} {
+			cfg := ReplayConfig{
+				Seed: seed, Duration: dur,
+				IMURate: 100, OdomRate: 20, PoseRate: 5,
+				DropProb: 0.03, OutlierProb: 0.01, OutlierScale: 5,
+				ReorderWindow: 12, Excited: true, // 不配 Clocks：零漂移
+			}
+			obs := GenerateReplay(cfg)
+			sOff, _, _ := ingestAndDrain(obs, replayTestConfig(), 64).Snapshot()
+			onE := ingestAndDrain(obs, alignTestConfig(), 64)
+			sOn, _, ok := onE.Snapshot()
+			if !ok {
+				t.Fatalf("dur=%v seed=%d 开对齐未初始化", dur, seed)
+			}
+			dp := vecNorm(vecSub(sOff.Position, sOn.Position))
+			dv := vecNorm(vecSub(sOff.Velocity, sOn.Velocity))
+			if dp > 1e-9 || dv > 1e-9 {
+				t.Fatalf("零漂移 dur=%v seed=%d 开关对齐不逐位一致: Δpos=%.3e Δvel=%.3e",
+					dur, seed, dp, dv)
+			}
+			// 各路在零漂移下必须保持 cold 恒等，绝不误锁。
+			for _, st := range onE.AlignmentStats() {
+				if !st.IsRef && st.State != AlignCold {
+					t.Fatalf("零漂移 dur=%v seed=%d 路 %s 误离开 cold: %s skew=%.5f off=%v",
+						dur, seed, st.Kind, st.State, st.Skew, st.Offset)
+				}
+			}
+		}
+	}
+}
+
+// TestAlignmentTimeVaryingNotWorse 漂移方向/幅度随时间变化（斜率换向）时，
+// 开对齐的融合轨迹误差不得比关对齐更差，且速度有界不发散；同时各路必须
+// locked、状态口径与实际换算一致。
+func TestAlignmentTimeVaryingNotWorse(t *testing.T) {
+	for _, dur := range []time.Duration{time.Minute, 3 * time.Minute} {
+		cfg := driftReplayConfig(dur)
+		obs := GenerateReplay(cfg)
+		ec := alignTestConfig()
+		ec.Limits.MaxPendingObs = 8192 // 离线追跑允许锚点确认暂态堆积；实时 1x 下有界
+		offE := ingestAndDrain(obs, replayTestConfig(), 64)
+		onE := ingestAndDrain(obs, ec, 64)
+		epOff, vOff := endErr(offE)
+		epOn, vOn := endErr(onE)
+		t.Logf("时变漂移 dur=%v OFF posErr=%.3fm |v|=%.2f | ON posErr=%.3fm |v|=%.2f",
+			dur, epOff, vOff, epOn, vOn)
+		if math.IsNaN(vOn) || math.IsInf(vOn, 0) || vOn > 6 {
+			t.Fatalf("开对齐速度发散/异常: |v|=%.3f", vOn)
+		}
+		// 开对齐必须不劣于关对齐（留 0.5m 容差吸收末端噪声，但不允许系统性变差）。
+		if epOn > epOff+0.5 {
+			t.Fatalf("开对齐位置误差(%.3fm)劣于关对齐(%.3fm)", epOn, epOff)
+		}
+		// 对外状态必须诚实：真正参与换算的两路都应 locked，绝不显示已锁定却发散。
+		for _, k := range []SensorKind{SensorOdometry, SensorAbsolutePose} {
+			if st := statOf(onE, k); st.State != AlignLocked {
+				t.Fatalf("dur=%v 路 %s 未锁定: %s", dur, k, st.State)
+			}
+		}
+	}
+}
+
+// TestAlignmentHalfHourReversalBounded 半小时回放：各路时钟漂移在运行中多
+// 次换向（偏移始终有界）。验证开对齐全程有界、末端不劣于关对齐、待处理
+// 始终有上限、且各路稳定锁定。这是“长时间把各路时钟随时间变化的漂移真
+// 实叠入回放”的长跑回归。
+func TestAlignmentHalfHourReversalBounded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("长跑用例")
+	}
+	cfg := ReplayConfig{
+		Seed: 77, Duration: 30 * time.Minute,
+		IMURate: 100, OdomRate: 20, PoseRate: 5,
+		DropProb: 0.03, OutlierProb: 0.01, OutlierScale: 5,
+		ReorderWindow: 12, Excited: true,
+		Clocks:  boundedReversalClocks(),
+		PoseGap: 5 * time.Second,
+	}
+	obs := GenerateReplay(cfg)
+	t.Logf("半小时换向漂移回放规模: %d 条", len(obs))
+
+	mk := func(on bool) Config {
+		var ec Config
+		if on {
+			ec = alignTestConfig()
+		} else {
+			ec = replayTestConfig()
+		}
+		ec.DegradeAfter = 3 * time.Second
+		ec.Limits.MaxPendingObs = 8192
+		ec.Limits.MaxProcessTime = time.Minute
+		return ec
+	}
+	offE := ingestAndDrain(obs, mk(false), 128)
+	onE := ingestAndDrain(obs, mk(true), 128)
+	epOff, vOff := endErr(offE)
+	epOn, vOn := endErr(onE)
+	st := onE.Stats()
+	t.Logf("半小时 OFF posErr=%.3fm |v|=%.2f | ON posErr=%.3fm |v|=%.2f peak=%d pending=%d",
+		epOff, vOff, epOn, vOn, st.PendingHigh, st.Pending)
+	if math.IsNaN(vOn) || math.IsInf(vOn, 0) || vOn > 6 {
+		t.Fatalf("半小时开对齐速度发散: |v|=%.3f", vOn)
+	}
+	if epOn > 3.0 {
+		t.Fatalf("半小时开对齐末端位置误差过大、未被时间对齐收敛: %.3fm", epOn)
+	}
+	if epOn > epOff+1.0 {
+		t.Fatalf("半小时开对齐(%.3fm)劣于关对齐(%.3fm)", epOn, epOff)
+	}
+	if st.PendingHigh > 8192 {
+		t.Fatalf("半小时待处理积压突破上限: peak=%d", st.PendingHigh)
+	}
+	if st.Pending != 0 {
+		t.Fatalf("排空后仍有待处理项: %d", st.Pending)
+	}
+	for _, k := range []SensorKind{SensorOdometry, SensorAbsolutePose} {
+		if s := statOf(onE, k); s.State != AlignLocked {
+			t.Fatalf("半小时路 %s 未保持 locked: %s", k, s.State)
+		}
+	}
+
+	// 确定性：相同输入重复运行严格一致。
+	onE2 := ingestAndDrain(obs, mk(true), 128)
+	s1, _, _ := onE.Snapshot()
+	s2, _, _ := onE2.Snapshot()
+	if !statesEqual(s1, s2, 1e-9) {
+		t.Fatalf("半小时开对齐两次运行不一致")
 	}
 }

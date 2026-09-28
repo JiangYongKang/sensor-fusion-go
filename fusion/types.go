@@ -68,6 +68,7 @@ const (
 	ReasonSensorDegraded   // 传感器降级，观测被降权或拒绝
 	ReasonLimitExceeded    // 单批规模超限
 	ReasonAlignCalibrating // 在线时间对齐样本不足，暂不采用
+	ReasonAlignDegraded    // 在线对齐校准超时未锁定，按原始时间恒等降级放行
 	ReasonBacklogExceeded  // 待处理积压过多，整批拒绝
 	ReasonProcessBudget    // 处理预算不足，整批拒绝
 )
@@ -94,6 +95,8 @@ func (r RejectReason) String() string {
 		return "limit_exceeded"
 	case ReasonAlignCalibrating:
 		return "align_calibrating"
+	case ReasonAlignDegraded:
+		return "align_degraded"
 	case ReasonBacklogExceeded:
 		return "backlog_exceeded"
 	case ReasonProcessBudget:

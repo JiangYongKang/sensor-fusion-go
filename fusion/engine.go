@@ -36,6 +36,7 @@ type Engine struct {
 	opsUsed     int // 当前 Ingest 调用内累计的确定性操作数
 	nowFunc     func() time.Time
 	sawRefKind  bool // 是否曾见到配置指定的参考路
+	sawPoseKind bool // 是否曾见到（任何状态的）绝对位姿观测
 }
 
 // anchorProbeCost 一次时延网格搜索的折算操作成本上限（粗+精网格
@@ -227,6 +228,9 @@ func (e *Engine) ingestOne(o Observation) (r ingestOut) {
 	if e.cfg.EnableAlignment && o.Kind == e.cfg.AlignRef {
 		e.sawRefKind = true
 	}
+	if o.Kind == SensorAbsolutePose {
+		e.sawPoseKind = true
+	}
 	res := e.align.Admit(o)
 	kind := o.Kind
 	r.deltaOps = res.ops
@@ -249,6 +253,10 @@ func (e *Engine) ingestOne(o Observation) (r ingestOut) {
 		r.pushed = e.buf.Push(r.p)
 		return r
 	}
+	// 校准宽限后仍未锁定的路按原始时间恒等放行：它不是“已对齐锁定”，
+	// 必须以可区分原因（align_degraded）对外表明这是未对齐降级数据，
+	// 绝不能伪装成 locked；消费时按降级膨胀噪声。
+	identityFallback := res.reason == ReasonAlignDegraded
 
 	// 时钟漂移硬边界检查（对齐关闭时保留既有原始时间戳语义）。
 	if !e.cfg.EnableAlignment && e.inited {
@@ -287,7 +295,8 @@ func (e *Engine) ingestOne(o Observation) (r ingestOut) {
 		return r
 	}
 
-	r.p = pendingItem{obs: o, aligned: res.aligned, raw: o.Stamp, ready: true, kind: kind}
+	r.p = pendingItem{obs: o, aligned: res.aligned, raw: o.Stamp,
+		ready: true, kind: kind, alignFallback: identityFallback}
 	if !e.buf.Push(r.p) {
 		// 容量已在批前预检；到此视为积压拒绝。
 		r.d = e.commit(Decision{Obs: o, RawStamp: o.Stamp,
@@ -316,6 +325,9 @@ func (e *Engine) retryPending() {
 		if r.ready {
 			p.ready = true
 			p.aligned = r.aligned
+			// 校准超时后按原始时间恒等降级放行的重判结果，携带降级标记，
+			// 使其在消费时仍以 align_degraded 口径记录并膨胀噪声。
+			p.alignFallback = r.reason == ReasonAlignDegraded
 			e.buf.SetIndex(i, p)
 		}
 	}
@@ -388,14 +400,21 @@ func (e *Engine) consume(p pendingItem) {
 				break
 			}
 		}
-		ready := (len(e.initObs) >= e.cfg.InitWindow && hasPose) ||
-			len(e.initObs) >= 3*e.cfg.InitWindow
+		// 只要系统里存在位姿路（哪怕其观测因对齐校准被暂缓），就绝不能
+		// 仅凭 IMU 以零位姿兜底启动——否则位姿路放出的观测会立刻陈旧、
+		// 永远无法把估计从错误初值拉回，IMU 积分会迅速发散。
+		// 3×InitWindow 的零位姿兜底只保留给“从头到尾根本没有位姿路”的
+		// 配置。有水线在对齐期间压住参考路，这里的等待不会无限堆积。
+		ready := hasPose && len(e.initObs) >= e.cfg.InitWindow
+		if !ready && !e.sawPoseKind && len(e.initObs) >= 3*e.cfg.InitWindow {
+			ready = true
+		}
 		if !ready {
 			e.consumed++
 			e.commit(Decision{Obs: o, RawStamp: p.raw, Aligned: p.aligned,
 				Reason: ReasonInsufficient,
-				Detail: fmt.Sprintf("init window %d/%d (pose=%v)",
-					len(e.initObs), e.cfg.InitWindow, hasPose)})
+				Detail: fmt.Sprintf("init window %d/%d (pose=%v present=%v)",
+					len(e.initObs), e.cfg.InitWindow, hasPose, e.sawPoseKind)})
 			return
 		}
 		e.initialize()
@@ -421,6 +440,13 @@ func (e *Engine) consume(p pendingItem) {
 	inflated := false
 	if e.degraded[o.Kind] {
 		inflated = true
+	}
+	// 校准宽限后按原始时间恒等放行的未对齐数据：膨胀噪声，并以
+	// sensor_degraded 口径在更新判定中体现（它确实不是已对齐数据）。
+	if p.alignFallback {
+		inflated = true
+	}
+	if inflated {
 		for i := range o.CovDiag {
 			o.CovDiag[i] *= e.cfg.DegradedNoiseInflate
 		}
@@ -445,7 +471,8 @@ func (e *Engine) consume(p pendingItem) {
 	}
 }
 
-// updateWith 执行门限更新并记录可区分判定。
+// updateWith 执行门限更新并记录可区分判定。恒等降级（未对齐放行）的
+// 观测即便通过门限也以 align_degraded 记录，避免被误读为已对齐更新。
 func (e *Engine) updateWith(o Observation, p pendingItem, inflated bool,
 	upd func(Observation, float64) (float64, bool)) {
 	d2, ok := upd(o, e.cfg.GateChi2)
@@ -458,6 +485,13 @@ func (e *Engine) updateWith(o Observation, p pendingItem, inflated bool,
 	}
 	e.lastSrc[o.Kind] = o.Stamp
 	e.consumed++
+	if p.alignFallback {
+		e.commit(Decision{Obs: o, RawStamp: p.raw, Aligned: p.aligned,
+			Accepted: true, Reason: ReasonAlignDegraded, Maha: d2,
+			Detail: fmt.Sprintf("alignment untrusted; identity fallback noise x%.0f",
+				e.cfg.DegradedNoiseInflate)})
+		return
+	}
 	if inflated {
 		e.commit(Decision{Obs: o, RawStamp: p.raw, Aligned: p.aligned,
 			Accepted: true, Reason: ReasonSensorDegraded, Maha: d2,
@@ -504,19 +538,36 @@ func (e *Engine) refreshDegraded(now time.Time) {
 	}
 }
 
-// AdvanceTo 将状态预测推进到统一时刻 t：先消费缓冲中不晚于 t 的
-// 已对齐观测，再纯预测剩余区间。目标时刻不晚于当前状态时返回可区分错误。
+// AdvanceTo 将状态预测推进到统一时刻 t：先消费缓冲中所有不晚于 t 的
+// **已就绪**观测（就绪本身意味着已对齐锁定或恒等可信；尚未对齐的暂缓
+// 项绝不消费），再纯预测剩余区间。这里不再用对齐水线钳制——水线是为
+// Ingest 时“乱序伙伴可能尚未到齐”准备的在线保护；AdvanceTo 由调用方
+// 显式驱动到某时刻，缓冲中已经就绪的观测就是该时刻前可用的全部数据，
+// 必须消费，否则偏离线追跑时状态会在锚点确认滞后下长时间纯预测而发散。
+// 目标时刻不晚于当前状态时返回可区分错误。
 func (e *Engine) AdvanceTo(t time.Time) Decision {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if !e.inited && e.buf.Len() == 0 {
 		return Decision{Reason: ReasonInsufficient, Detail: "not initialized"}
 	}
+	// 排空口径：允许锁定路对最新锚点做半窗右外推，把在线严格口径暂缓的
+	// 尾部一次放出。AdvanceTo 是显式“追到 t”，这些点不会再被后续锚点重
+	// 算（本调用内即消费），故不存在回跳；结束后恢复在线严格口径。
+	e.align.SetDraining(true)
+	defer e.align.SetDraining(false)
 	e.retryPending()
 	e.buf.RemapAll(e.align)
 	limit := t
-	if wm, ok := e.alignedHorizon(); ok && wm.Before(limit) {
-		limit = wm
+	// ReorderDelay 是乱序等待窗口（与时间对齐无关），仍予保留；对齐
+	// 就绪状态已单独保证安全，不再叠加水线。
+	if e.cfg.ReorderDelay > 0 {
+		if maxReady, ok := e.buf.MaxReadyAligned(); ok {
+			dh := maxReady.Add(-e.cfg.ReorderDelay)
+			if dh.Before(limit) {
+				limit = dh
+			}
+		}
 	}
 	for {
 		idx, ok := e.buf.MinReadyIndex(limit)
