@@ -62,8 +62,16 @@ const (
 	ReasonInsufficient     // 数据不足（如缺少初始化观测）
 	ReasonTimeUnavailable  // 时间不可用（时钟漂移超界等）
 	ReasonSensorDegraded   // 传感器降级，观测被降权或拒绝
-	ReasonLimitExceeded    // 规模/耗时超限
+	ReasonLimitExceeded    // 规模/耗时超限（统称；单批超限即此值）
+	ReasonAlignCalibrating // 在线时间对齐样本不足，尚不可信，暂不采用
+	ReasonAlignOutOfRange  // 时钟漂移超出可信范围，对齐不可用
+	ReasonBacklogFull      // 待处理积压过多（重排缓冲将满），整批拒绝
+	ReasonBudgetExceeded   // 单次处理预算不够，整批拒绝
 )
+
+// ReasonBatchTooLarge 是“单批规模超限”的语义化别名，
+// 与 ReasonLimitExceeded 同值，保证既有判定契约不变的同时可区分三类边界。
+const ReasonBatchTooLarge = ReasonLimitExceeded
 
 func (r RejectReason) String() string {
 	switch r {
@@ -85,6 +93,14 @@ func (r RejectReason) String() string {
 		return "sensor_degraded"
 	case ReasonLimitExceeded:
 		return "limit_exceeded"
+	case ReasonAlignCalibrating:
+		return "align_calibrating"
+	case ReasonAlignOutOfRange:
+		return "align_out_of_range"
+	case ReasonBacklogFull:
+		return "backlog_full"
+	case ReasonBudgetExceeded:
+		return "budget_exceeded"
 	}
 	return "none"
 }
@@ -114,9 +130,70 @@ type Config struct {
 	DegradeAfter  time.Duration // 某路缺失超过此时长进入降级
 	MaxClockDrift time.Duration // 允许的最大时钟漂移
 	InitWindow    int           // 初始化所需的最少观测数
+	// InitFallbackAfter 无绝对位姿时零位姿兜底初始化前的最短等待时长，
+	// 以便各路在线时钟在校准期攒够样本；为 0 时取默认 3s。
+	InitFallbackAfter time.Duration
+	// AlignBootstrapGrace 时钟引导宽限：provisional 路观测落后状态在
+	// (StaleAfter, AlignBootstrapGrace) 内时视为疑似初始时钟偏移，
+	// 允许进入缓冲仅用于学习、不参与更新；为 0 时默认 1s。
+	AlignBootstrapGrace time.Duration
 	// DegradedNoiseInflate 是传感器降级恢复期间观测噪声的膨胀倍数。
 	DegradedNoiseInflate float64
 	// ReorderDelay 是乱序等待窗口：时间戳晚于（最新观测-窗口）的
 	// 观测保留在缓冲中等待乱序伙伴；为 0 时每批摄入后立即全部消费。
 	ReorderDelay time.Duration
+	// AlignEnabled 开启在线时间对齐。默认开启；显式置 false 时引擎
+	// 退化为“传感器时间戳即统一时间”的旧行为，结果与旧版本逐位一致。
+	AlignEnabled *bool
+	// AlignRequireCalibration 严格模式：上电即要求各路先校准，
+	// 样本不足前观测以 align_calibrating 暂不采用。默认 false 表示
+	// 恒等先验（上电即信任、同时在线辨识），与既有融合行为逐位兼容。
+	AlignRequireCalibration bool
+	// AlignMinSamples 一路时钟模型被采纳前至少需要的有效样本数。
+	AlignMinSamples int
+	// AlignConfirmSamples 偏移估计连续显著（超过 AlignActivateAt）
+	// 达到该样本数后，才从恒等先验切换到估计模型。
+	AlignConfirmSamples int
+	// AlignActivateAt 偏移显著判定阈值；低于该阈值始终使用恒等映射，
+	// 保证无漂移输入的处理路径与旧版本完全一致。
+	AlignActivateAt time.Duration
+	// AlignMaxOffset 允许的对齐偏移范围 |offset| 上限，超出即判漂移越界。
+	AlignMaxOffset time.Duration
+	// AlignMaxSkew 允许的时钟斜率偏差 |skew| 上限（无量纲，如 5000e-6=0.5%）。
+	AlignMaxSkew float64
+	// AlignForgetting 递归最小二乘遗忘因子（0,1]，1 表示不遗忘）。
+	AlignForgetting float64
+	// AlignInitStd 时钟偏移先验标准差（统一时间秒）。
+	AlignInitStd time.Duration
+	// AlignProcessStd 时钟偏移随机游走过程噪声（每秒标准差，秒/√s）。
+	AlignProcessStd float64
+	// AlignMeasStd 时钟样本测量噪声标准差（秒）。
+	AlignMeasStd time.Duration
+	// AlignMaxHeld 校准期暂存队列上限（每路），防止待处理数据无界增长。
+	AlignMaxHeld int
+	// AlignMinMotion 生成时钟样本所需的最小运动速率
+	// （位置 0.05m/s、姿态 0.02rad/s 量级；由实现内部使用）。
+	AlignMinLinVel float64
+	AlignMinAngVel float64
+}
+
+// AlignStatus 一路传感器时钟对齐的当前状态（诊断用）。
+type AlignStatus struct {
+	Kind      SensorKind
+	Phase     string // "reference" / "calibrating" / "provisional" / "active" / "out_of_range"
+	Offset    time.Duration
+	Skew      float64
+	Samples   int
+	Confirmed int
+	Mapped    bool   // 是否真正使用估计模型换算（false=恒等映射）
+	Trusted   bool   // 换算结果是否可参与更新
+	Detail    string // 不可信时的可区分原因
+}
+
+// Stats 引擎运行统计（长跑容量/稳定性诊断用）。
+type Stats struct {
+	PeakPending      int
+	Ingested         int // 进入重排缓冲的观测数
+	Consumed         int // 出队进入状态推进的观测数
+	RejectedByReason map[RejectReason]int64
 }

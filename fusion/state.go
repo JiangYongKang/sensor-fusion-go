@@ -85,12 +85,34 @@ func (e *Estimator) AddProcessNoise(diag [9]float64, dt float64) {
 	}
 }
 
-// update 通用线性观测更新。
-// res: m 维残差；H: m×9 行优先；rDiag: m 维观测噪声对角。
-// 返回马氏平方与是否通过门限。Joseph 形式保证协方差正定性。
-func (e *Estimator) update(res []float64, H []float64, rDiag []float64, gateChi2 float64) (float64, bool) {
+// innovation 一次线性观测的创新评估结果（不修改状态）。
+type innovation struct {
+	res    []float64
+	H      []float64
+	rDiag  []float64
+	maha2  float64
+	passed bool
+}
+
+// evaluate 计算创新、S 与马氏平方并做门限判定，但不注入误差状态。
+// 与 commit 使用完全一致的确定性运算顺序组装 S，保证评估与提交可复核。
+func (e *Estimator) evaluate(res []float64, H []float64, rDiag []float64, gateChi2 float64) innovation {
+	S := e.innovationS(res, H, rDiag)
+	L, ok := S.Cholesky()
+	if !ok {
+		return innovation{res: res, H: H, rDiag: rDiag, maha2: math.Inf(1), passed: false}
+	}
+	y := SolveLower(L, res)
+	var d2 float64
+	for _, v := range y {
+		d2 += v * v
+	}
+	return innovation{res: res, H: H, rDiag: rDiag, maha2: d2, passed: d2 <= gateChi2}
+}
+
+// innovationS 计算创新协方差 S = H·P·Hᵀ + R。
+func (e *Estimator) innovationS(res []float64, H []float64, rDiag []float64) Mat {
 	m := len(res)
-	// S = H·P·Hᵀ + R（m×m）
 	S := NewMat(m)
 	for i := 0; i < m; i++ {
 		for j := 0; j < m; j++ {
@@ -110,18 +132,17 @@ func (e *Estimator) update(res []float64, H []float64, rDiag []float64, gateChi2
 			S.Set(i, j, s)
 		}
 	}
+	return S
+}
+
+// commit 对已通过门限的创新执行 KF 更新（Joseph 形式 + 误差注入）。
+func (e *Estimator) commit(iv innovation) {
+	m := len(iv.res)
+	res, H, rDiag := iv.res, iv.H, iv.rDiag
+	S := e.innovationS(res, H, rDiag)
 	L, ok := S.Cholesky()
 	if !ok {
-		return math.Inf(1), false // 数值异常，拒绝且不污染状态
-	}
-	// 马氏平方 d² = resᵀ·S⁻¹·res
-	y := SolveLower(L, res)
-	var d2 float64
-	for _, v := range y {
-		d2 += v * v
-	}
-	if d2 > gateChi2 {
-		return d2, false
+		return // 数值异常：不污染状态（evaluate 已先行拒绝）
 	}
 	// K = P·Hᵀ·S⁻¹（9×m）。转置求解：对 K 的每一行 r，
 	// 解 S·x = (P·Hᵀ) 的第 r 行（m 维），x 即 K 的第 r 行。
@@ -175,11 +196,20 @@ func (e *Estimator) update(res []float64, H []float64, rDiag []float64, gateChi2
 	e.Cov.ClampDiagFloor(1e-12)
 
 	e.injectError(dx)
-	return d2, true
 }
 
 // UpdateOdometry 里程计速度观测（机体系线速度），返回马氏平方与是否被接受。
 func (e *Estimator) UpdateOdometry(o Observation, gateChi2 float64) (float64, bool) {
+	iv := e.EvaluateOdometry(o, gateChi2)
+	if !iv.passed {
+		return iv.maha2, false
+	}
+	e.commit(iv)
+	return iv.maha2, true
+}
+
+// EvaluateOdometry 仅评估里程计创新（不修改状态），供门限与时钟学习共用。
+func (e *Estimator) EvaluateOdometry(o Observation, gateChi2 float64) innovation {
 	// 预测观测：机体系速度 = Rᵀ·v_world
 	pred := QuatRotate(QuatConj(e.Nominal.Rotation), e.Nominal.Velocity)
 	res := []float64{o.LinVel.X - pred.X, o.LinVel.Y - pred.Y, o.LinVel.Z - pred.Z}
@@ -194,11 +224,21 @@ func (e *Estimator) UpdateOdometry(o Observation, gateChi2 float64) (float64, bo
 		}
 	}
 	rDiag := []float64{o.CovDiag[0], o.CovDiag[1], o.CovDiag[2]}
-	return e.update(res, H, rDiag, gateChi2)
+	return e.evaluate(res, H, rDiag, gateChi2)
 }
 
 // UpdateAbsolutePose 绝对位姿观测更新。
 func (e *Estimator) UpdateAbsolutePose(o Observation, gateChi2 float64) (float64, bool) {
+	iv := e.EvaluateAbsolutePose(o, gateChi2)
+	if !iv.passed {
+		return iv.maha2, false
+	}
+	e.commit(iv)
+	return iv.maha2, true
+}
+
+// EvaluateAbsolutePose 仅评估绝对位姿创新（不修改状态）。
+func (e *Estimator) EvaluateAbsolutePose(o Observation, gateChi2 float64) innovation {
 	// 位置残差
 	resP := vecSub(o.Pose.Position, e.Nominal.Position)
 	// 姿态残差：δθ = log(q̂⁻¹ ⊗ q_obs)
@@ -215,7 +255,7 @@ func (e *Estimator) UpdateAbsolutePose(o Observation, gateChi2 float64) (float64
 		o.CovDiag[0], o.CovDiag[1], o.CovDiag[2],
 		o.CovDiag[3], o.CovDiag[4], o.CovDiag[5],
 	}
-	return e.update(res, H, rDiag, gateChi2)
+	return e.evaluate(res, H, rDiag, gateChi2)
 }
 
 // Snapshot 返回状态深拷贝快照（供并发读取）。
@@ -260,9 +300,11 @@ func skew(v Vec3) Mat {
 	return m
 }
 
-// PredictConstantVelocity 无 IMU 时的恒定速度模型推进：
+// PredictConstantVelocity 无 IMU 驱动时的恒定速度模型推进：
 // p ← p + v·dt，速度与姿态保持不变，协方差按 δp←δv 耦合传播。
-func (e *Estimator) PredictConstantVelocity(dt float64) {
+// 刻意不旋转姿态：对无漂移输入这与旧版本逐位一致；时钟对齐的姿态
+// 速率证据由引擎用最近 IMU 陀螺单独计算，不改动预测语义。
+func (e *Estimator) PredictConstantVelocity(dt float64, _ ...Vec3) {
 	if dt <= 0 {
 		return
 	}

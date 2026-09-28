@@ -7,6 +7,37 @@ import (
 	"time"
 )
 
+// ClockKnot 描述某路传感器时钟在一个时刻的状态：
+// 在 Knot 时刻传感器读数相对真值的偏移 Offset；随后该路时钟以
+// Skew（相对真值的速率，0=不漂移）运行，直到下一个节点。
+// 多个节点即可模拟“快慢在运行中变化、方向/幅度不一致”的设备时钟。
+type ClockKnot struct {
+	At     time.Duration // 相对回放起点
+	Offset time.Duration // 该时刻读数偏移
+	Skew   float64       // 下一区间的速率偏差（如 +500e-6 表示快 500ppm）
+}
+
+// ClockProfile 一路时钟的分段线性漂移曲线；为空表示无漂移（逐位恒等）。
+type ClockProfile []ClockKnot
+
+// offsetAt 计算真值时刻 t（相对起点）对应的传感器读数偏移。
+func (p ClockProfile) offsetAt(t time.Duration) time.Duration {
+	if len(p) == 0 {
+		return 0
+	}
+	if t <= p[0].At {
+		return p[0].Offset
+	}
+	for i := 0; i < len(p)-1; i++ {
+		if t >= p[i].At && t < p[i+1].At {
+			dt := t - p[i].At
+			return p[i].Offset + time.Duration(p[i].Skew*float64(dt))
+		}
+	}
+	last := p[len(p)-1]
+	return last.Offset + time.Duration(last.Skew*float64(t-last.At))
+}
+
 // ReplayConfig 本地传感器回放数据生成配置。
 // 相同配置（含 Seed）必然生成完全相同的观测序列，保证可复现。
 type ReplayConfig struct {
@@ -19,8 +50,15 @@ type ReplayConfig struct {
 	OutlierProb   float64       // 异常值概率
 	OutlierScale  float64       // 异常幅度（米 / 弧度量级）
 	ReorderWindow int           // 乱序窗口（条）：局部洗牌幅度
-	ClockDrift    time.Duration // 全程累计时钟漂移（线性，作用于绝对位姿路）
+	ClockDrift    time.Duration // 兼容字段：全程线性累计偏移（仅绝对位姿路）
 	PoseGap       time.Duration // 绝对位姿中途缺测时长（模拟传感器降级）
+	// OdomGap 里程计中途缺测时长（模拟某路长时间无数据）。
+	OdomGap time.Duration
+	// PoseGapAt / OdomGapAt 指定缺测窗口起点；为 0 时默认在回放中点。
+	PoseGapAt time.Duration
+	OdomGapAt time.Duration
+	// Clocks 各路随时间变化的漂移曲线；设置后优先于 ClockDrift。
+	Clocks map[SensorKind]ClockProfile
 }
 
 // Trajectory 真值轨迹：绕原点水平圆周 + 垂直正弦起伏，可解析求导。
@@ -95,6 +133,22 @@ func GenerateReplay(cfg ReplayConfig) []Observation {
 	rng := rand.New(rand.NewSource(cfg.Seed))
 	start := time.Unix(1_700_000_000, 0)
 	traj := DefaultTrajectory(start, cfg.Duration)
+	clocks := cfg.Clocks
+	if clocks == nil {
+		clocks = map[SensorKind]ClockProfile{}
+	}
+	// stamped 按该路时钟曲线把真值时刻换算为传感器读数；
+	// 物理量仍在真值时刻采样（时间戳与物理量解耦，模拟真实设备）。
+	stamped := func(k SensorKind, t time.Time) time.Time {
+		if p, ok := clocks[k]; ok && len(p) > 0 {
+			return t.Add(p.offsetAt(t.Sub(start)))
+		}
+		if k == SensorAbsolutePose && cfg.ClockDrift != 0 {
+			frac := t.Sub(start).Seconds() / cfg.Duration.Seconds()
+			return t.Add(time.Duration(frac * float64(cfg.ClockDrift)))
+		}
+		return t
+	}
 
 	var out []Observation
 	var seq uint64
@@ -111,7 +165,7 @@ func GenerateReplay(cfg ReplayConfig) []Observation {
 			gyro := Vec3{Z: traj.Omega}
 			out = append(out, Observation{
 				Kind:  SensorIMU,
-				Stamp: t,
+				Stamp: stamped(SensorIMU, t),
 				Seq:   next(),
 				Accel: Vec3{
 					specific.X + rng.NormFloat64()*replayIMUAccelNoise,
@@ -130,7 +184,16 @@ func GenerateReplay(cfg ReplayConfig) []Observation {
 	// --- 里程计：机体系线速度 ---
 	if cfg.OdomRate > 0 {
 		dt := time.Duration(float64(time.Second) / cfg.OdomRate)
+		ogAt := cfg.OdomGapAt
+		if ogAt == 0 {
+			ogAt = cfg.Duration / 2
+		}
+		ogStart := start.Add(ogAt)
+		ogEnd := ogStart.Add(cfg.OdomGap)
 		for t := start; t.Before(start.Add(cfg.Duration)); t = t.Add(dt) {
+			if cfg.OdomGap > 0 && !t.Before(ogStart) && t.Before(ogEnd) {
+				continue
+			}
 			if rng.Float64() < cfg.DropProb {
 				continue // 丢帧
 			}
@@ -138,7 +201,7 @@ func GenerateReplay(cfg ReplayConfig) []Observation {
 			velB := QuatRotate(QuatConj(pose.Rotation), traj.TrueVelAt(t))
 			o := Observation{
 				Kind:  SensorOdometry,
-				Stamp: t,
+				Stamp: stamped(SensorOdometry, t),
 				Seq:   next(),
 				LinVel: Vec3{
 					velB.X + rng.NormFloat64()*replayOdomNoise,
@@ -158,9 +221,12 @@ func GenerateReplay(cfg ReplayConfig) []Observation {
 	// --- 绝对位姿：含中途缺测（降级模拟）与时钟漂移 ---
 	if cfg.PoseRate > 0 {
 		dt := time.Duration(float64(time.Second) / cfg.PoseRate)
-		gapStart := start.Add(cfg.Duration / 2)
+		gAt := cfg.PoseGapAt
+		if gAt == 0 {
+			gAt = cfg.Duration / 2
+		}
+		gapStart := start.Add(gAt)
 		gapEnd := gapStart.Add(cfg.PoseGap)
-		total := cfg.Duration.Seconds()
 		for t := start; t.Before(start.Add(cfg.Duration)); t = t.Add(dt) {
 			if cfg.PoseGap > 0 && !t.Before(gapStart) && t.Before(gapEnd) {
 				continue // 缺测窗口
@@ -169,12 +235,9 @@ func GenerateReplay(cfg ReplayConfig) []Observation {
 				continue
 			}
 			pose := traj.TruePoseAt(t)
-			// 时钟漂移：全程线性累计，观测时间戳被偏移
-			frac := t.Sub(start).Seconds() / total
-			stamp := t.Add(time.Duration(frac * float64(cfg.ClockDrift)))
 			o := Observation{
 				Kind:  SensorAbsolutePose,
-				Stamp: stamp,
+				Stamp: stamped(SensorAbsolutePose, t),
 				Seq:   next(),
 				Pose: Pose{
 					Position: Vec3{
